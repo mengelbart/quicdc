@@ -13,22 +13,23 @@ import (
 )
 
 const (
-	errCodeDropped = 0x01
+	errorCodeUnknownFlowID = 0x01
 )
 
 type transport interface {
-	quic.Connection
+	OpenUniStream() (quic.SendStream, error)
+	AcceptUniStream(context.Context) (quic.ReceiveStream, error)
 }
 
-type PeerConnection struct {
+type Session struct {
 	t        transport
 	acceptCh chan quic.ReceiveStream
 	channels map[uint64]*DataChannel
 	lock     sync.Mutex
 }
 
-func NewPeerConnection(t transport) *PeerConnection {
-	pc := &PeerConnection{
+func NewSession(t transport) *Session {
+	pc := &Session{
 		t:        t,
 		acceptCh: make(chan quic.ReceiveStream),
 		channels: map[uint64]*DataChannel{},
@@ -38,7 +39,7 @@ func NewPeerConnection(t transport) *PeerConnection {
 	return pc
 }
 
-func (c *PeerConnection) NewDataChannel(id uint64, priority uint64, ordered bool, rxTime time.Duration, rxCount uint64, label string, protocol string) (*DataChannel, error) {
+func (c *Session) NewDataChannel(id uint64, priority uint64, ordered bool, rxTime time.Duration, rxCount uint64, label string, protocol string) (*DataChannel, error) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -148,7 +149,7 @@ func (d *DataChannel) open() error {
 	return err
 }
 
-func (c *PeerConnection) Accept(ctx context.Context) (*DataChannel, error) {
+func (c *Session) Accept(ctx context.Context) (*DataChannel, error) {
 	var s quic.ReceiveStream
 	select {
 	case <-ctx.Done():
@@ -191,7 +192,7 @@ func (c *PeerConnection) Accept(ctx context.Context) (*DataChannel, error) {
 	return d, nil
 }
 
-func (c *PeerConnection) read() {
+func (c *Session) read() {
 	for {
 		s, err := c.t.AcceptUniStream(context.Background())
 		if err != nil {
@@ -202,29 +203,33 @@ func (c *PeerConnection) read() {
 		if err != nil {
 			panic(err)
 		}
-		mt, err := quicvarint.Read(r)
-		if err != nil {
-			panic(err)
+		c.ReadStream(s, id)
+	}
+}
+
+func (c *Session) ReadStream(s quic.ReceiveStream, flowID uint64) {
+	mt, err := quicvarint.Read(quicvarint.NewReader(s))
+	if err != nil {
+		panic(err)
+	}
+	switch mt {
+	case uint64(dataChannelOpenMessageType):
+		select {
+		case c.acceptCh <- s:
+		case <-time.After(time.Second):
+			log.Println("dropping incoming data channel")
+			s.CancelRead(errorCodeUnknownFlowID)
 		}
-		switch mt {
-		case uint64(dataChannelOpenMessageType):
-			select {
-			case c.acceptCh <- s:
-			case <-time.After(time.Second):
-				log.Println("dropping incoming data channel")
-				s.CancelRead(errCodeDropped)
-			}
-		case uint64(dataChannelOpenOkMessageType):
-			panic("TODO")
-		case uint64(dataChannelMessageType):
-			c.lock.Lock()
-			dc, ok := c.channels[id]
-			c.lock.Unlock()
-			if !ok {
-				panic("TODO: GOT MESSAGE FOR UNKNOWN CHANNEL, NEED TO BUFFER?")
-			}
-			dc.streamBuffer <- s
+	case uint64(dataChannelOpenOkMessageType):
+		panic("TODO")
+	case uint64(dataChannelMessageType):
+		c.lock.Lock()
+		dc, ok := c.channels[flowID]
+		c.lock.Unlock()
+		if !ok {
+			panic("TODO: GOT MESSAGE FOR UNKNOWN CHANNEL, NEED TO BUFFER?")
 		}
+		dc.streamBuffer <- s
 	}
 }
 
@@ -267,7 +272,7 @@ type DataChannelReadMessage struct {
 
 // Close implements io.ReadCloser.
 func (m *DataChannelReadMessage) Close() error {
-	m.s.CancelRead(errCodeDropped)
+	m.s.CancelRead(errorCodeUnknownFlowID)
 	return nil
 }
 

@@ -44,7 +44,7 @@ func runServer() error {
 	if err != nil {
 		return err
 	}
-	pc := quicdc.NewPeerConnection(conn)
+	pc := quicdc.NewSession(conn)
 	dc, err := pc.Accept(ctx)
 	if err != nil {
 		return err
@@ -75,7 +75,7 @@ func runClient() error {
 	if err != nil {
 		return err
 	}
-	pc := quicdc.NewPeerConnection(c)
+	pc := quicdc.NewSession(c)
 	dc, err := pc.NewDataChannel(0, 0, false, 0, 0, "test", "proto")
 	if err != nil {
 		return err
