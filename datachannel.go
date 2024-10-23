@@ -1,11 +1,10 @@
 package quicdc
 
 import (
+	"container/heap"
 	"context"
-	"errors"
 	"io"
 	"log"
-	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -16,310 +15,178 @@ const (
 	errorCodeUnknownFlowID = 0x01
 )
 
-type transport interface {
-	OpenUniStream() (quic.SendStream, error)
-	AcceptUniStream(context.Context) (quic.ReceiveStream, error)
-}
-
-type Session struct {
-	t        transport
-	acceptCh chan quic.ReceiveStream
-	channels map[uint64]*DataChannel
-	lock     sync.Mutex
-}
-
-func NewSession(t transport) *Session {
-	pc := &Session{
-		t:        t,
-		acceptCh: make(chan quic.ReceiveStream),
-		channels: map[uint64]*DataChannel{},
-		lock:     sync.Mutex{},
-	}
-	go pc.read()
-	return pc
-}
-
-func (c *Session) NewDataChannel(id uint64, priority uint64, ordered bool, rxTime time.Duration, rxCount uint64, label string, protocol string) (*DataChannel, error) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-
-	if _, ok := c.channels[id]; ok {
-		return nil, errors.New("datachannel with ID already exists")
-	}
-
-	dc := &DataChannel{
-		t:             c.t,
-		header:        []byte{},
-		sendSeqNr:     0,
-		recvSeqNr:     0,
-		streamBuffer:  make(chan quic.ReceiveStream),
-		reorderBuffer: map[uint64]*DataChannelReadMessage{},
-		readMsgbuffer: make(chan *DataChannelReadMessage),
-		ID:            id,
-		Priority:      priority,
-		Ordered:       ordered,
-		RXTime:        rxTime,
-		RXCount:       rxCount,
-		Label:         label,
-		Protocol:      protocol,
-	}
-	if err := dc.open(); err != nil {
-		return nil, err
-	}
-	c.channels[dc.ID] = dc
-	return dc, nil
-}
-
 type DataChannel struct {
-	t             transport
+	connection    Connection
 	header        []byte
-	sendSeqNr     uint64
-	recvSeqNr     uint64
-	streamBuffer  chan quic.ReceiveStream
-	reorderBuffer map[uint64]*DataChannelReadMessage
-	readMsgbuffer chan *DataChannelReadMessage
+	nextSendSeqNr uint64
+	nextRecvSeqNr uint64
+	reorderBuffer messageHeap
+	recvBuffer    chan *DataChannelReadMessage
 
-	ID       uint64
-	Priority uint64
-	Ordered  bool
-	RXTime   time.Duration
-	RXCount  uint64
-	Label    string
-	Protocol string
+	id       uint64
+	priority uint64
+	ordered  bool
+	rxTime   time.Duration
+	label    string
+	protocol string
 }
 
-func (d *DataChannel) read() {
-	for s := range d.streamBuffer {
-		d.handleIncomingMessageStream(s)
-	}
-}
-
-func (d *DataChannel) handleIncomingMessageStream(s quic.ReceiveStream) {
-	m := dataChannelMessage{}
-	if err := m.parse(quicvarint.NewReader(s)); err != nil {
-		// TODO: Close channel?
-		panic(err)
-	}
-	log.Printf("handling incoming message: %v", m)
-	if !d.Ordered || m.SequenceNumber == d.recvSeqNr {
-		d.readMsgbuffer <- &DataChannelReadMessage{
-			s: s,
-		}
-		d.recvSeqNr++
-		for {
-			next, ok := d.reorderBuffer[d.recvSeqNr]
-			if !ok {
-				break
-			}
-			d.readMsgbuffer <- next
-			d.recvSeqNr++
-		}
-		return
-	}
-	if _, ok := d.reorderBuffer[m.SequenceNumber]; ok {
-		panic("TODO: got duplicate message sequence number?")
-	}
-	d.reorderBuffer[m.SequenceNumber] = &DataChannelReadMessage{
-		s: s,
+func newDataChannel(
+	conn Connection,
+	id uint64,
+	priority uint64,
+	ordered bool,
+	rxTime time.Duration,
+	label string,
+	protocol string,
+) *DataChannel {
+	return &DataChannel{
+		connection:    conn,
+		header:        []byte{},
+		nextSendSeqNr: 0,
+		nextRecvSeqNr: 0,
+		reorderBuffer: messageHeap{},
+		recvBuffer:    make(chan *DataChannelReadMessage, 1024),
+		id:            id,
+		priority:      priority,
+		ordered:       ordered,
+		rxTime:        rxTime,
+		label:         label,
+		protocol:      protocol,
 	}
 }
 
 func (d *DataChannel) open() error {
 	d.header = make([]byte, 0, 64_000)
-	s, err := d.t.OpenUniStream()
-	if err != nil {
-		return err
-	}
-
-	ct, err := getChannelType(d.Ordered, d.RXTime, d.RXCount)
+	s, err := d.connection.OpenUniStream()
 	if err != nil {
 		return err
 	}
 	dcom := dataChannelOpenMessage{
-		ChannelID:            d.ID,
-		ChannelType:          ct,
-		Priority:             d.Priority,
-		ReliabilityParameter: getReliabilityParameter(d.RXTime, d.RXCount),
-		Label:                d.Label,
-		Protocol:             d.Protocol,
+		ChannelID:            d.id,
+		ChannelType:          getChannelType(d.ordered, d.rxTime),
+		Priority:             d.priority,
+		ReliabilityParameter: uint64(d.rxTime.Milliseconds()),
+		Label:                d.label,
+		Protocol:             d.protocol,
 	}
-	go d.read()
 	buf := dcom.append(d.header)
-	_, err = s.Write(buf)
-	return err
+	if _, err = s.Write(buf); err != nil {
+		return err
+	}
+	return s.Close()
 }
 
-func (c *Session) Accept(ctx context.Context) (*DataChannel, error) {
-	var s quic.ReceiveStream
+func (d *DataChannel) pushMessage(ctx context.Context, msg *DataChannelReadMessage) {
+	log.Printf("pushing message")
 	select {
+	case d.recvBuffer <- msg:
 	case <-ctx.Done():
-		return nil, ctx.Err()
-	case s = <-c.acceptCh:
 	}
-	m := dataChannelOpenMessage{}
-	if err := m.parse(quicvarint.NewReader(s)); err != nil {
-		// TODO: Close channel?
-		return nil, err
-	}
-	o, rt, rc := m.ChannelType.parameters(m.ReliabilityParameter)
-	d := &DataChannel{
-		t:             c.t,
-		header:        make([]byte, 0, 4096),
-		sendSeqNr:     0,
-		recvSeqNr:     0,
-		streamBuffer:  make(chan quic.ReceiveStream),
-		reorderBuffer: map[uint64]*DataChannelReadMessage{},
-		readMsgbuffer: make(chan *DataChannelReadMessage),
-		ID:            m.ChannelID,
-		Priority:      m.Priority,
-		Ordered:       o,
-		RXTime:        rt,
-		RXCount:       rc,
-		Label:         m.Label,
-		Protocol:      m.Protocol,
-	}
-
-	c.lock.Lock()
-	defer c.lock.Unlock()
-
-	if _, ok := c.channels[d.ID]; ok {
-		// TODO: Close conn?
-		return nil, errors.New("datachannel with ID already exists")
-	}
-	c.channels[d.ID] = d
-	go d.read()
-
-	return d, nil
+	return
 }
 
-func (c *Session) read() {
+func (d *DataChannel) drainReorderBuffer(ctx context.Context) {
 	for {
-		s, err := c.t.AcceptUniStream(context.Background())
-		if err != nil {
-			panic(err)
+		head := d.reorderBuffer.peek()
+		if head == nil {
+			return
 		}
-		r := quicvarint.NewReader(s)
-		id, err := quicvarint.Read(r)
-		if err != nil {
-			panic(err)
+		if head.SequenceNumber != d.nextRecvSeqNr {
+			return
 		}
-		c.ReadStream(s, id)
+		d.pushMessage(ctx, heap.Pop(&d.reorderBuffer).(*DataChannelReadMessage))
+		d.nextRecvSeqNr++
 	}
 }
 
-func (c *Session) ReadStream(s quic.ReceiveStream, flowID uint64) {
-	mt, err := quicvarint.Read(quicvarint.NewReader(s))
-	if err != nil {
-		panic(err)
+func (d *DataChannel) handleIncomingMessageStream(ctx context.Context, s quic.ReceiveStream) error {
+	m := dataChannelMessage{}
+	if err := m.parse(quicvarint.NewReader(s)); err != nil {
+		return err
 	}
-	switch mt {
-	case uint64(dataChannelOpenMessageType):
-		select {
-		case c.acceptCh <- s:
-		case <-time.After(time.Second):
-			log.Println("dropping incoming data channel")
-			s.CancelRead(errorCodeUnknownFlowID)
-		}
-	case uint64(dataChannelOpenOkMessageType):
-		panic("TODO")
-	case uint64(dataChannelMessageType):
-		c.lock.Lock()
-		dc, ok := c.channels[flowID]
-		c.lock.Unlock()
-		if !ok {
-			panic("TODO: GOT MESSAGE FOR UNKNOWN CHANNEL, NEED TO BUFFER?")
-		}
-		dc.streamBuffer <- s
+	log.Printf("handling incoming message for channel ID: %v, sequence number: %v", d.id, m.SequenceNumber)
+	rm := &DataChannelReadMessage{
+		SequenceNumber: m.SequenceNumber,
+		stream:         s,
 	}
+	if d.ordered {
+		heap.Push(&d.reorderBuffer, rm)
+		d.drainReorderBuffer(ctx)
+	} else {
+		d.pushMessage(ctx, rm)
+	}
+	return nil
 }
 
-type DataChannelWriteMessage struct {
-	s io.WriteCloser
-}
-
-// Close implements io.WriteCloser.
-func (m *DataChannelWriteMessage) Close() error {
-	return m.s.Close()
-}
-
-// Write implements io.WriteCloser.
-func (m *DataChannelWriteMessage) Write(p []byte) (n int, err error) {
-	return m.s.Write(p)
-}
-
-func (d *DataChannel) SendMessage() (io.WriteCloser, error) {
-	s, err := d.t.OpenUniStream()
+func (d *DataChannel) SendMessage(ctx context.Context) (io.WriteCloser, error) {
+	s, err := d.connection.OpenUniStreamSync(ctx)
 	if err != nil {
 		return nil, err
 	}
 	dcm := dataChannelMessage{
-		ChannelID:      d.ID,
-		SequenceNumber: d.sendSeqNr,
+		ChannelID:      d.id,
+		SequenceNumber: d.nextSendSeqNr,
 	}
-	d.sendSeqNr++
+	d.nextSendSeqNr++
 	_, err = s.Write(dcm.append(d.header))
 	if err != nil {
 		return nil, err
 	}
 	return &DataChannelWriteMessage{
-		s: s,
+		stream: s,
 	}, nil
-}
-
-type DataChannelReadMessage struct {
-	s quic.ReceiveStream
-}
-
-// Close implements io.ReadCloser.
-func (m *DataChannelReadMessage) Close() error {
-	m.s.CancelRead(errorCodeUnknownFlowID)
-	return nil
-}
-
-// Read implements io.ReadCloser.
-func (m *DataChannelReadMessage) Read(p []byte) (n int, err error) {
-	return m.s.Read(p)
 }
 
 func (d *DataChannel) ReceiveMessage(ctx context.Context) (io.ReadCloser, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case msg := <-d.readMsgbuffer:
+	case msg := <-d.recvBuffer:
 		return msg, nil
 	}
 }
 
-func getChannelType(ordered bool, rxtime time.Duration, rxcount uint64) (dataChannelType, error) {
-	if rxtime > 0 && rxcount > 0 {
-		return 0, errors.New("invalid partial reliability setting")
-	}
+func getChannelType(ordered bool, rxtime time.Duration) dataChannelType {
 	if ordered {
 		if rxtime > 0 {
-			return dataChannelTypePartialReliableTimed, nil
+			return dataChannelTypePartialReliableTimed
 		}
-		if rxcount > 0 {
-			return dataChannelTypePartialReliableRexmit, nil
-		}
-		return dataChannelTypeReliable, nil
+		return dataChannelTypeReliable
 	}
 
 	if rxtime > 0 {
-		return dataChannelTypePartialReliableTimedUnordered, nil
+		return dataChannelTypePartialReliableTimedUnordered
 	}
-	if rxcount > 0 {
-		return dataChannelTypePartialReliableRexmitUnordered, nil
-	}
-
-	return dataChannelTypeReliableUnordered, nil
+	return dataChannelTypeReliableUnordered
 }
 
-func getReliabilityParameter(rxtime time.Duration, rxcount uint64) uint64 {
-	if rxtime > 0 {
-		return uint64(rxtime.Milliseconds())
-	}
-	if rxcount > 0 {
-		return rxcount
-	}
-	return 0
+type DataChannelReadMessage struct {
+	SequenceNumber uint64
+	stream         quic.ReceiveStream
+}
+
+// Close implements io.ReadCloser.
+func (m *DataChannelReadMessage) Close() error {
+	m.stream.CancelRead(errorCodeUnknownFlowID)
+	return nil
+}
+
+// Read implements io.ReadCloser.
+func (m *DataChannelReadMessage) Read(p []byte) (n int, err error) {
+	return m.stream.Read(p)
+}
+
+type DataChannelWriteMessage struct {
+	stream io.WriteCloser
+}
+
+// Close implements io.WriteCloser.
+func (m *DataChannelWriteMessage) Close() error {
+	return m.stream.Close()
+}
+
+// Write implements io.WriteCloser.
+func (m *DataChannelWriteMessage) Write(p []byte) (n int, err error) {
+	return m.stream.Write(p)
 }

@@ -18,32 +18,25 @@ const (
 type dataChannelType uint64
 
 const (
-	dataChannelTypeReliable                       dataChannelType = 0x00
-	dataChannelTypeReliableUnordered              dataChannelType = 0x80
-	dataChannelTypePartialReliableRexmit          dataChannelType = 0x01
-	dataChannelTypePartialReliableRexmitUnordered dataChannelType = 0x81
-	dataChannelTypePartialReliableTimed           dataChannelType = 0x02
-	dataChannelTypePartialReliableTimedUnordered  dataChannelType = 0x82
-	dataChannelTypeReserved0x7f                   dataChannelType = 0x7f
-	dataChannelTypeReserved0xff                   dataChannelType = 0xff
+	dataChannelTypeReliable          dataChannelType = 0x00
+	dataChannelTypeReliableUnordered dataChannelType = 0x80
+
+	dataChannelTypePartialReliableTimed          dataChannelType = 0x02
+	dataChannelTypePartialReliableTimedUnordered dataChannelType = 0x82
 )
 
-func (t dataChannelType) parameters(reliabilityParameter uint64) (ordered bool, rxTime time.Duration, rxCount uint64) {
+func (t dataChannelType) parameters(reliabilityParameter uint64) (ordered bool, rxTime time.Duration) {
 	switch t {
 	case dataChannelTypeReliable:
-		return true, 0, 0
+		return true, 0
 	case dataChannelTypeReliableUnordered:
-		return false, 0, 0
-	case dataChannelTypePartialReliableRexmit:
-		return true, 0, reliabilityParameter
-	case dataChannelTypePartialReliableRexmitUnordered:
-		return false, 0, reliabilityParameter
+		return false, 0
 	case dataChannelTypePartialReliableTimed:
-		return true, time.Duration(reliabilityParameter) * time.Millisecond, 0
+		return true, time.Duration(reliabilityParameter) * time.Millisecond
 	case dataChannelTypePartialReliableTimedUnordered:
-		return false, time.Duration(reliabilityParameter) * time.Millisecond, 0
+		return false, time.Duration(reliabilityParameter) * time.Millisecond
 	}
-	return true, 0, 0
+	return true, 0
 }
 
 type dataChannelOpenMessage struct {
