@@ -139,6 +139,8 @@ func (d *DataChannel) SendMessage(ctx context.Context) (io.WriteCloser, error) {
 }
 
 func (d *DataChannel) ReceiveMessage(ctx context.Context) (io.ReadCloser, error) {
+	log.Printf("ReceiveMessage, recvBufferLen: %v", len(d.recvBuffer))
+	defer log.Printf("ReceiveMessage done")
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
