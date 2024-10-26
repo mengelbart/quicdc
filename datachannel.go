@@ -11,6 +11,11 @@ import (
 	"github.com/quic-go/quic-go/quicvarint"
 )
 
+type prioritySetter interface {
+	SetPriority(uint32)
+	SetIncremental(bool)
+}
+
 const (
 	errorCodeUnknownFlowID = 0x01
 )
@@ -61,6 +66,11 @@ func (d *DataChannel) open() error {
 	s, err := d.connection.OpenUniStream()
 	if err != nil {
 		return err
+	}
+
+	if ps, ok := s.(prioritySetter); ok {
+		ps.SetPriority(uint32(d.priority))
+		ps.SetIncremental(false)
 	}
 	dcom := dataChannelOpenMessage{
 		ChannelID:            d.id,
