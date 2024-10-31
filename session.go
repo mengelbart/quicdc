@@ -109,6 +109,7 @@ func (s *Session) ReadStream(ctx context.Context, stream quic.ReceiveStream, cha
 			return err
 		}
 		s.onDataChannel(dc)
+		return ackStream.Close()
 	case uint64(dataChannelOpenOkMessageType):
 		log.Printf("received dataChannelOpenOkMessage for channel ID: %v", channelID)
 	case uint64(dataChannelMessageType):

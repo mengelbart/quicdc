@@ -1,7 +1,6 @@
 package quicdc
 
 import (
-	"container/heap"
 	"context"
 	"io"
 	"log"
@@ -25,7 +24,7 @@ type DataChannel struct {
 	header        []byte
 	nextSendSeqNr uint64
 	nextRecvSeqNr uint64
-	reorderBuffer messageHeap
+	reorderBuffer *messageHeap
 	recvBuffer    chan *DataChannelReadMessage
 
 	id       uint64
@@ -50,8 +49,8 @@ func newDataChannel(
 		header:        []byte{},
 		nextSendSeqNr: 0,
 		nextRecvSeqNr: 0,
-		reorderBuffer: messageHeap{},
-		recvBuffer:    make(chan *DataChannelReadMessage, 1024),
+		reorderBuffer: &messageHeap{},
+		recvBuffer:    make(chan *DataChannelReadMessage),
 		id:            id,
 		priority:      priority,
 		ordered:       ordered,
@@ -88,7 +87,8 @@ func (d *DataChannel) open() error {
 }
 
 func (d *DataChannel) pushMessage(ctx context.Context, msg *DataChannelReadMessage) {
-	log.Printf("pushing message")
+	log.Printf("pushing message %v, recvBufferLen: %v", msg.SequenceNumber, len(d.recvBuffer))
+	log.Printf("pushed message %v, recvBufferLen: %v", msg.SequenceNumber, len(d.recvBuffer))
 	select {
 	case d.recvBuffer <- msg:
 	case <-ctx.Done():
@@ -97,6 +97,7 @@ func (d *DataChannel) pushMessage(ctx context.Context, msg *DataChannelReadMessa
 }
 
 func (d *DataChannel) drainReorderBuffer(ctx context.Context) {
+	log.Printf("reorder buffer: %v", d.reorderBuffer)
 	for {
 		head := d.reorderBuffer.peek()
 		if head == nil {
@@ -105,7 +106,7 @@ func (d *DataChannel) drainReorderBuffer(ctx context.Context) {
 		if head.SequenceNumber != d.nextRecvSeqNr {
 			return
 		}
-		d.pushMessage(ctx, heap.Pop(&d.reorderBuffer).(*DataChannelReadMessage))
+		d.pushMessage(ctx, d.reorderBuffer.dequeue())
 		d.nextRecvSeqNr++
 	}
 }
@@ -115,13 +116,13 @@ func (d *DataChannel) handleIncomingMessageStream(ctx context.Context, s quic.Re
 	if err := m.parse(quicvarint.NewReader(s)); err != nil {
 		return err
 	}
-	log.Printf("handling incoming message for channel ID: %v, sequence number: %v", d.id, m.SequenceNumber)
+	log.Printf("handling incoming message for channel ID: %v, sequence number: %v, streamID: %v", d.id, m.SequenceNumber, s.StreamID())
 	rm := &DataChannelReadMessage{
 		SequenceNumber: m.SequenceNumber,
 		stream:         s,
 	}
 	if d.ordered {
-		heap.Push(&d.reorderBuffer, rm)
+		d.reorderBuffer.enqueue(rm)
 		d.drainReorderBuffer(ctx)
 	} else {
 		d.pushMessage(ctx, rm)
@@ -129,7 +130,7 @@ func (d *DataChannel) handleIncomingMessageStream(ctx context.Context, s quic.Re
 	return nil
 }
 
-func (d *DataChannel) SendMessage(ctx context.Context) (io.WriteCloser, error) {
+func (d *DataChannel) SendMessage(ctx context.Context) (*DataChannelWriteMessage, error) {
 	s, err := d.connection.OpenUniStreamSync(ctx)
 	if err != nil {
 		return nil, err
@@ -144,11 +145,12 @@ func (d *DataChannel) SendMessage(ctx context.Context) (io.WriteCloser, error) {
 		return nil, err
 	}
 	return &DataChannelWriteMessage{
-		stream: s,
+		SequenceNumber: dcm.SequenceNumber,
+		stream:         s,
 	}, nil
 }
 
-func (d *DataChannel) ReceiveMessage(ctx context.Context) (io.ReadCloser, error) {
+func (d *DataChannel) ReceiveMessage(ctx context.Context) (*DataChannelReadMessage, error) {
 	log.Printf("ReceiveMessage, recvBufferLen: %v", len(d.recvBuffer))
 	defer log.Printf("ReceiveMessage done")
 	select {
@@ -190,7 +192,8 @@ func (m *DataChannelReadMessage) Read(p []byte) (n int, err error) {
 }
 
 type DataChannelWriteMessage struct {
-	stream io.WriteCloser
+	SequenceNumber uint64
+	stream         io.WriteCloser
 }
 
 // Close implements io.WriteCloser.
