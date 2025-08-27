@@ -10,10 +10,12 @@ import (
 func TestMessageHeap(t *testing.T) {
 	t.Run("peek", func(t *testing.T) {
 		mh := &messageHeap{
-			&DataChannelReadMessage{SequenceNumber: 0},
-			&DataChannelReadMessage{SequenceNumber: 1},
-			&DataChannelReadMessage{SequenceNumber: 2},
-			&DataChannelReadMessage{SequenceNumber: 3},
+			data: []*DataChannelReadMessage{
+				{SequenceNumber: 0},
+				{SequenceNumber: 1},
+				{SequenceNumber: 2},
+				{SequenceNumber: 3},
+			},
 		}
 		heap.Init(mh)
 		assert.Equal(t, &DataChannelReadMessage{SequenceNumber: 0}, mh.peek())
@@ -21,10 +23,12 @@ func TestMessageHeap(t *testing.T) {
 
 	t.Run("pop", func(t *testing.T) {
 		mh := &messageHeap{
-			&DataChannelReadMessage{SequenceNumber: 0},
-			&DataChannelReadMessage{SequenceNumber: 1},
-			&DataChannelReadMessage{SequenceNumber: 2},
-			&DataChannelReadMessage{SequenceNumber: 3},
+			data: []*DataChannelReadMessage{
+				{SequenceNumber: 0},
+				{SequenceNumber: 1},
+				{SequenceNumber: 2},
+				{SequenceNumber: 3},
+			},
 		}
 		heap.Init(mh)
 		assert.Equal(t, &DataChannelReadMessage{SequenceNumber: 0}, heap.Pop(mh))
