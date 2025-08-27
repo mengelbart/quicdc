@@ -67,10 +67,10 @@ func (d *DataChannel) open() error {
 		return err
 	}
 
-	if ps, ok := s.(prioritySetter); ok {
-		ps.SetPriority(uint32(d.priority))
-		ps.SetIncremental(false)
-	}
+	// if ps, ok := s.(prioritySetter); ok {
+	// 	ps.SetPriority(uint32(d.priority))
+	// 	ps.SetIncremental(false)
+	// }
 	dcom := dataChannelOpenMessage{
 		ChannelID:            d.id,
 		ChannelType:          getChannelType(d.ordered, d.rxTime),
@@ -93,7 +93,6 @@ func (d *DataChannel) pushMessage(ctx context.Context, msg *DataChannelReadMessa
 	case d.recvBuffer <- msg:
 	case <-ctx.Done():
 	}
-	return
 }
 
 func (d *DataChannel) drainReorderBuffer(ctx context.Context) {
@@ -111,7 +110,7 @@ func (d *DataChannel) drainReorderBuffer(ctx context.Context) {
 	}
 }
 
-func (d *DataChannel) handleIncomingMessageStream(ctx context.Context, s quic.ReceiveStream) error {
+func (d *DataChannel) handleIncomingMessageStream(ctx context.Context, s *quic.ReceiveStream) error {
 	m := dataChannelMessage{}
 	if err := m.parse(quicvarint.NewReader(s)); err != nil {
 		return err
@@ -177,7 +176,7 @@ func getChannelType(ordered bool, rxtime time.Duration) dataChannelType {
 
 type DataChannelReadMessage struct {
 	SequenceNumber uint64
-	stream         quic.ReceiveStream
+	stream         *quic.ReceiveStream
 }
 
 // Close implements io.ReadCloser.

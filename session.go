@@ -12,9 +12,9 @@ import (
 )
 
 type Connection interface {
-	OpenUniStream() (quic.SendStream, error)
-	OpenUniStreamSync(context.Context) (quic.SendStream, error)
-	AcceptUniStream(context.Context) (quic.ReceiveStream, error)
+	OpenUniStream() (*quic.SendStream, error)
+	OpenUniStreamSync(context.Context) (*quic.SendStream, error)
+	AcceptUniStream(context.Context) (*quic.ReceiveStream, error)
 }
 
 type OnDataChannelHandler func(*DataChannel)
@@ -72,7 +72,7 @@ func (s *Session) OnIncomingDataChannel(handler OnDataChannelHandler) {
 	s.dcHandler = handler
 }
 
-func (s *Session) ReadStream(ctx context.Context, stream quic.ReceiveStream, channelID uint64) error {
+func (s *Session) ReadStream(ctx context.Context, stream *quic.ReceiveStream, channelID uint64) error {
 	mt, err := quicvarint.Read(quicvarint.NewReader(stream))
 	if err != nil {
 		return err
