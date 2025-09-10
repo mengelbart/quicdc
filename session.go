@@ -112,6 +112,12 @@ func (s *Session) ReadStream(ctx context.Context, stream *quic.ReceiveStream, ch
 		return ackStream.Close()
 	case uint64(dataChannelOpenOkMessageType):
 		log.Printf("received dataChannelOpenOkMessage for channel ID: %v", channelID)
+		dc, ok := s.getChannel(channelID)
+		if !ok {
+			return fmt.Errorf("got OpenOk message for unknown channel ID: %v", channelID)
+		}
+		dc.handleAck()
+		return nil
 	case uint64(dataChannelMessageType):
 		dc, ok := s.getChannel(channelID)
 		if !ok {

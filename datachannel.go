@@ -33,6 +33,8 @@ type DataChannel struct {
 	rxTime   time.Duration
 	label    string
 	protocol string
+
+	ackChan chan struct{} // TODO: use waitgroup?
 }
 
 func newDataChannel(
@@ -57,6 +59,7 @@ func newDataChannel(
 		rxTime:        rxTime,
 		label:         label,
 		protocol:      protocol,
+		ackChan:       make(chan struct{}),
 	}
 }
 
@@ -66,11 +69,14 @@ func (d *DataChannel) open() error {
 	if err != nil {
 		return err
 	}
+	defer s.Close()
 
 	// if ps, ok := s.(prioritySetter); ok {
 	// 	ps.SetPriority(uint32(d.priority))
 	// 	ps.SetIncremental(false)
 	// }
+
+	// send DATA_CHANNEL_OPEN message
 	dcom := dataChannelOpenMessage{
 		ChannelID:            d.id,
 		ChannelType:          getChannelType(d.ordered, d.rxTime),
@@ -83,7 +89,16 @@ func (d *DataChannel) open() error {
 	if _, err = s.Write(buf); err != nil {
 		return err
 	}
-	return s.Close()
+
+	// wait for DATA_CHANNEL_OPEN_ACK message
+	<-d.ackChan
+
+	return nil
+}
+
+// handleAck informes open() goroutine that the open ack message has been received
+func (d *DataChannel) handleAck() {
+	d.ackChan <- struct{}{}
 }
 
 func (d *DataChannel) pushMessage(ctx context.Context, msg *DataChannelReadMessage) {
@@ -127,6 +142,10 @@ func (d *DataChannel) handleIncomingMessageStream(ctx context.Context, s *quic.R
 		d.pushMessage(ctx, rm)
 	}
 	return nil
+}
+
+func (d *DataChannel) ID() uint64 {
+	return d.id
 }
 
 func (d *DataChannel) SendMessage(ctx context.Context) (*DataChannelWriteMessage, error) {
