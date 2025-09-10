@@ -91,7 +91,7 @@ type dataChannelOpenOkMessage struct {
 }
 
 func (m *dataChannelOpenOkMessage) append(b []byte) []byte {
-	quicvarint.Append(b, m.ChannelID)
+	b = quicvarint.Append(b, m.ChannelID)
 	return quicvarint.Append(b, uint64(dataChannelOpenOkMessageType))
 }
 
