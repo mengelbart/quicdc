@@ -3,7 +3,6 @@ package quicdc
 import (
 	"context"
 	"io"
-	"log"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -102,8 +101,6 @@ func (d *DataChannel) handleAck() {
 }
 
 func (d *DataChannel) pushMessage(ctx context.Context, msg *DataChannelReadMessage) {
-	log.Printf("pushing message %v, recvBufferLen: %v", msg.SequenceNumber, len(d.recvBuffer))
-	log.Printf("pushed message %v, recvBufferLen: %v", msg.SequenceNumber, len(d.recvBuffer))
 	select {
 	case d.recvBuffer <- msg:
 	case <-ctx.Done():
@@ -111,7 +108,6 @@ func (d *DataChannel) pushMessage(ctx context.Context, msg *DataChannelReadMessa
 }
 
 func (d *DataChannel) drainReorderBuffer(ctx context.Context) {
-	log.Printf("reorder buffer: %v", d.reorderBuffer)
 	for {
 		head := d.reorderBuffer.peek()
 		if head == nil {
@@ -130,7 +126,6 @@ func (d *DataChannel) handleIncomingMessageStream(ctx context.Context, s *quic.R
 	if err := m.parse(quicvarint.NewReader(s)); err != nil {
 		return err
 	}
-	log.Printf("handling incoming message for channel ID: %v, sequence number: %v, streamID: %v", d.id, m.SequenceNumber, s.StreamID())
 	rm := &DataChannelReadMessage{
 		SequenceNumber: m.SequenceNumber,
 		stream:         s,
@@ -169,8 +164,6 @@ func (d *DataChannel) SendMessage(ctx context.Context) (*DataChannelWriteMessage
 }
 
 func (d *DataChannel) ReceiveMessage(ctx context.Context) (*DataChannelReadMessage, error) {
-	log.Printf("ReceiveMessage, recvBufferLen: %v", len(d.recvBuffer))
-	defer log.Printf("ReceiveMessage done")
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
