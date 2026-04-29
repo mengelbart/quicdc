@@ -3,9 +3,9 @@ package quicdc
 import (
 	"context"
 	"io"
+	"log/slog"
 	"time"
 
-	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/quicvarint"
 )
 
@@ -70,10 +70,11 @@ func (d *DataChannel) open() error {
 	}
 	defer s.Close()
 
-	// if ps, ok := s.(prioritySetter); ok {
-	// 	ps.SetPriority(uint32(d.priority))
-	// 	ps.SetIncremental(false)
-	// }
+	if ps, ok := s.(prioritySetter); ok {
+		slog.Info("dc setting stream priority", "priority", d.priority, "incremental", true)
+		ps.SetPriority(uint32(d.priority))
+		ps.SetIncremental(true)
+	}
 
 	// send DATA_CHANNEL_OPEN message
 	dcom := dataChannelOpenMessage{
@@ -121,7 +122,7 @@ func (d *DataChannel) drainReorderBuffer(ctx context.Context) {
 	}
 }
 
-func (d *DataChannel) handleIncomingMessageStream(ctx context.Context, s *quic.ReceiveStream) error {
+func (d *DataChannel) handleIncomingMessageStream(ctx context.Context, s ReceiveStream) error {
 	m := dataChannelMessage{}
 	if err := m.parse(quicvarint.NewReader(s)); err != nil {
 		return err
@@ -147,6 +148,11 @@ func (d *DataChannel) SendMessage(ctx context.Context) (*DataChannelWriteMessage
 	s, err := d.connection.OpenUniStreamSync(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if ps, ok := s.(prioritySetter); ok {
+		slog.Info("dc setting stream priority", "priority", d.priority, "incremental", true)
+		ps.SetPriority(uint32(d.priority))
+		ps.SetIncremental(true)
 	}
 	dcm := dataChannelMessage{
 		ChannelID:      d.id,
@@ -188,7 +194,7 @@ func getChannelType(ordered bool, rxtime time.Duration) dataChannelType {
 
 type DataChannelReadMessage struct {
 	SequenceNumber uint64
-	stream         *quic.ReceiveStream
+	stream         ReceiveStream
 }
 
 // Close implements io.ReadCloser.

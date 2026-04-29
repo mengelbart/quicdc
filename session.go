@@ -3,25 +3,36 @@ package quicdc
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"sync"
 	"time"
 
-	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/quicvarint"
 )
 
+type SendStream interface {
+	io.Writer
+	io.Closer
+}
+
+type ReceiveStream interface {
+	io.Reader
+	ID() int64
+	CancelRead(uint64)
+}
+
 type Connection interface {
-	OpenUniStream() (*quic.SendStream, error)
-	OpenUniStreamSync(context.Context) (*quic.SendStream, error)
-	AcceptUniStream(context.Context) (*quic.ReceiveStream, error)
+	OpenUniStream() (SendStream, error)
+	OpenUniStreamSync(context.Context) (SendStream, error)
+	AcceptUniStream(context.Context) (ReceiveStream, error)
 }
 
 type OnDataChannelHandler func(*DataChannel)
 
 type Session struct {
 	conn     Connection
-	acceptCh chan quic.ReceiveStream
+	acceptCh chan ReceiveStream
 
 	channels    map[uint64]*DataChannel
 	channelLock sync.Mutex
@@ -33,7 +44,7 @@ type Session struct {
 func NewSession(conn Connection) *Session {
 	pc := &Session{
 		conn:        conn,
-		acceptCh:    make(chan quic.ReceiveStream),
+		acceptCh:    make(chan ReceiveStream),
 		channels:    map[uint64]*DataChannel{},
 		channelLock: sync.Mutex{},
 	}
@@ -72,7 +83,7 @@ func (s *Session) OnIncomingDataChannel(handler OnDataChannelHandler) {
 	s.dcHandler = handler
 }
 
-func (s *Session) ReadStream(ctx context.Context, stream *quic.ReceiveStream, channelID uint64) error {
+func (s *Session) ReadStream(ctx context.Context, stream ReceiveStream, channelID uint64) error {
 	mt, err := quicvarint.Read(quicvarint.NewReader(stream))
 	if err != nil {
 		return err
