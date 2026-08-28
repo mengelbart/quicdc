@@ -1,11 +1,16 @@
 package quicdc
 
 import (
+	"fmt"
 	"io"
 	"time"
 
 	"github.com/quic-go/quic-go/quicvarint"
 )
+
+// maxVarIntStringLen bounds the length of a label or protocol string read from
+// the wire, so a peer cannot force a large allocation.
+const maxVarIntStringLen = 4096
 
 type messageType uint64
 
@@ -119,14 +124,12 @@ func parseVarIntString(r quicvarint.Reader) (string, error) {
 	if l == 0 {
 		return "", nil
 	}
-	val := make([]byte, l)
-	var m int
-	m, err = r.Read(val)
-	if err != nil {
-		return "", err
+	if l > maxVarIntStringLen {
+		return "", fmt.Errorf("string length %v exceeds maximum of %v", l, maxVarIntStringLen)
 	}
-	if uint64(m) != l {
-		return "", io.EOF
+	val := make([]byte, l)
+	if _, err := io.ReadFull(r, val); err != nil {
+		return "", err
 	}
 	return string(val), nil
 }
