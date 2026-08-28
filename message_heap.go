@@ -44,9 +44,9 @@ func (h *messageHeap) Pop() any {
 	old := h.data
 	n := len(old)
 	x := old[n-1]
+	old[n-1] = nil
 	h.data = old[0 : n-1]
 	return x
-
 }
 
 func (h *messageHeap) peek() *DataChannelReadMessage {
