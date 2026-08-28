@@ -59,14 +59,19 @@ func (c *Session) Read() {
 		if err != nil {
 			panic(err)
 		}
-		r := quicvarint.NewReader(s)
-		id, err := quicvarint.Read(r)
-		if err != nil {
-			panic(err)
-		}
-		if err := c.ReadStream(context.Background(), s, id); err != nil {
-			log.Printf("failed to read stream for channel ID %v: %v", id, err)
-		}
+		// Each stream is handled in its own goroutine, so that a stream
+		// waiting for the application to read a message does not block the
+		// other channels of the session.
+		go func() {
+			id, err := quicvarint.Read(quicvarint.NewReader(s))
+			if err != nil {
+				log.Printf("failed to read channel ID: %v", err)
+				return
+			}
+			if err := c.ReadStream(context.Background(), s, id); err != nil {
+				log.Printf("failed to read stream for channel ID %v: %v", id, err)
+			}
+		}()
 	}
 }
 
