@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go/quicvarint"
@@ -33,7 +34,8 @@ type DataChannel struct {
 	label    string
 	protocol string
 
-	ackChan chan struct{} // TODO: use waitgroup?
+	ackChan chan struct{}
+	ackOnce sync.Once
 }
 
 func newDataChannel(
@@ -96,9 +98,12 @@ func (d *DataChannel) open() error {
 	return nil
 }
 
-// handleAck informes open() goroutine that the open ack message has been received
+// handleAck informs the open() goroutine that the open ack message has been
+// received. Repeated calls are no-ops.
 func (d *DataChannel) handleAck() {
-	d.ackChan <- struct{}{}
+	d.ackOnce.Do(func() {
+		close(d.ackChan)
+	})
 }
 
 func (d *DataChannel) pushMessage(ctx context.Context, msg *DataChannelReadMessage) {
