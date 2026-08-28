@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go/quicvarint"
@@ -21,8 +22,11 @@ const (
 
 type DataChannel struct {
 	connection    Connection
-	header        []byte
-	nextSendSeqNr uint64
+	nextSendSeqNr atomic.Uint64
+
+	// recvLock guards nextRecvSeqNr and the enqueue/drain sequence on the
+	// reorder buffer.
+	recvLock      sync.Mutex
 	nextRecvSeqNr uint64
 	reorderBuffer *messageHeap
 	recvBuffer    chan *DataChannelReadMessage
@@ -49,8 +53,6 @@ func newDataChannel(
 ) *DataChannel {
 	return &DataChannel{
 		connection:    conn,
-		header:        []byte{},
-		nextSendSeqNr: 0,
 		nextRecvSeqNr: 0,
 		reorderBuffer: &messageHeap{},
 		recvBuffer:    make(chan *DataChannelReadMessage),
@@ -65,7 +67,6 @@ func newDataChannel(
 }
 
 func (d *DataChannel) open() error {
-	d.header = make([]byte, 0, 64_000)
 	s, err := d.connection.OpenUniStream()
 	if err != nil {
 		return err
@@ -87,7 +88,7 @@ func (d *DataChannel) open() error {
 		Label:                d.label,
 		Protocol:             d.protocol,
 	}
-	buf := dcom.append(d.header)
+	buf := dcom.append(make([]byte, 0, 64))
 	if _, err = s.Write(buf); err != nil {
 		return err
 	}
@@ -113,6 +114,7 @@ func (d *DataChannel) pushMessage(ctx context.Context, msg *DataChannelReadMessa
 	}
 }
 
+// drainReorderBuffer must be called with recvLock held.
 func (d *DataChannel) drainReorderBuffer(ctx context.Context) {
 	for {
 		head := d.reorderBuffer.peek()
@@ -137,6 +139,8 @@ func (d *DataChannel) handleIncomingMessageStream(ctx context.Context, s Receive
 		stream:         s,
 	}
 	if d.ordered {
+		d.recvLock.Lock()
+		defer d.recvLock.Unlock()
 		d.reorderBuffer.enqueue(rm)
 		d.drainReorderBuffer(ctx)
 	} else {
@@ -149,6 +153,8 @@ func (d *DataChannel) ID() uint64 {
 	return d.id
 }
 
+// SendMessage opens a new stream for the next message on the data channel. It
+// is safe for concurrent use.
 func (d *DataChannel) SendMessage(ctx context.Context) (*DataChannelWriteMessage, error) {
 	s, err := d.connection.OpenUniStreamSync(ctx)
 	if err != nil {
@@ -161,10 +167,9 @@ func (d *DataChannel) SendMessage(ctx context.Context) (*DataChannelWriteMessage
 	}
 	dcm := dataChannelMessage{
 		ChannelID:      d.id,
-		SequenceNumber: d.nextSendSeqNr,
+		SequenceNumber: d.nextSendSeqNr.Add(1) - 1,
 	}
-	d.nextSendSeqNr++
-	_, err = s.Write(dcm.append(d.header))
+	_, err = s.Write(dcm.append(make([]byte, 0, 32)))
 	if err != nil {
 		return nil, err
 	}
