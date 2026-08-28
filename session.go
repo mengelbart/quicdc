@@ -64,13 +64,17 @@ func (c *Session) Read() {
 		if err != nil {
 			panic(err)
 		}
-		c.ReadStream(context.Background(), s, id)
+		if err := c.ReadStream(context.Background(), s, id); err != nil {
+			log.Printf("failed to read stream for channel ID %v: %v", id, err)
+		}
 	}
 }
 
 func (s *Session) OpenDataChannel(channelID, priority uint64, ordered bool, rxTime time.Duration, label string, protocol string) (*DataChannel, error) {
 	dc := newDataChannel(s.conn, channelID, priority, ordered, rxTime, label, protocol)
-	s.addChannel(channelID, dc)
+	if err := s.addChannel(channelID, dc); err != nil {
+		return nil, err
+	}
 	if err := dc.open(); err != nil {
 		return nil, err
 	}
@@ -111,7 +115,7 @@ func (s *Session) ReadStream(ctx context.Context, stream ReceiveStream, channelI
 		if err != nil {
 			return err
 		}
-		defer ackStream.Close()
+		defer func() { _ = ackStream.Close() }()
 		dcoom := dataChannelOpenOkMessage{
 			ChannelID: channelID,
 		}
@@ -120,7 +124,7 @@ func (s *Session) ReadStream(ctx context.Context, stream ReceiveStream, channelI
 			return err
 		}
 		s.onDataChannel(dc)
-		return ackStream.Close()
+		return nil
 	case uint64(dataChannelOpenOkMessageType):
 		log.Printf("received dataChannelOpenOkMessage for channel ID: %v", channelID)
 		dc, ok := s.getChannel(channelID)
