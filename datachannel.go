@@ -68,7 +68,7 @@ func (d *DataChannel) open() error {
 	if err != nil {
 		return err
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	if ps, ok := s.(prioritySetter); ok {
 		slog.Info("dc setting stream priority", "priority", d.priority, "incremental", true)
