@@ -76,6 +76,7 @@ func (s *Session) OpenDataChannel(channelID, priority uint64, ordered bool, rxTi
 		return nil, err
 	}
 	if err := dc.open(); err != nil {
+		s.removeChannel(channelID)
 		return nil, err
 	}
 	return dc, nil
@@ -166,6 +167,12 @@ func (s *Session) addChannel(id uint64, dc *DataChannel) error {
 	}
 	s.channels[id] = dc
 	return nil
+}
+
+func (s *Session) removeChannel(id uint64) {
+	s.channelLock.Lock()
+	defer s.channelLock.Unlock()
+	delete(s.channels, id)
 }
 
 func (s *Session) getChannel(id uint64) (*DataChannel, bool) {
