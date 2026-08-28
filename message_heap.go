@@ -12,6 +12,8 @@ type messageHeap struct {
 }
 
 func (h *messageHeap) String() string {
+	h.lock.Lock()
+	defer h.lock.Unlock()
 	res := ""
 	for i, m := range h.data {
 		res += fmt.Sprintf("%v", m.SequenceNumber)
