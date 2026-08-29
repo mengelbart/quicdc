@@ -67,7 +67,9 @@ func WithLogger(logger *slog.Logger) Option {
 }
 
 // WithMaxReorderBufferLen bounds how many out of order messages an ordered
-// data channel buffers while it waits for a gap to be filled.
+// data channel buffers while it waits for a gap to be filled. It also sizes
+// the window an unordered data channel uses to detect repeated sequence
+// numbers.
 func WithMaxReorderBufferLen(n int) Option {
 	return func(s *Session) {
 		if n > 0 {
@@ -147,7 +149,7 @@ func (c *Session) Run(ctx context.Context) error {
 					c.abort(errorCodeProtocolViolation, err)
 					return
 				}
-				if errors.Is(err, ErrReorderBufferOverflow) {
+				if errors.Is(err, ErrReorderBufferOverflow) || errors.Is(err, ErrSequenceWindowOverflow) {
 					c.abort(errorCodeExcessiveLoad, err)
 					return
 				}

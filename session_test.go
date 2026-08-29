@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"sync"
 	"testing"
 	"time"
@@ -168,6 +169,34 @@ func partialReliableOpenStream(id int64, channelID uint64, rxTime time.Duration)
 	return &fakeReceiveStream{r: bytes.NewReader(m.append(nil)), id: id}
 }
 
+// unorderedOpenStream opens a channel of type t, which must be one of the
+// unordered types.
+func unorderedOpenStream(id int64, channelID uint64, t dataChannelType, rxTime time.Duration) *fakeReceiveStream {
+	m := dataChannelOpenMessage{
+		ChannelID:            channelID,
+		ChannelType:          t,
+		ReliabilityParameter: uint64(rxTime.Milliseconds()),
+		Label:                "label",
+		Protocol:             "protocol",
+	}
+	return &fakeReceiveStream{r: bytes.NewReader(m.append(nil)), id: id}
+}
+
+// parseOpenMessage parses the DATA_CHANNEL_OPEN message a session wrote to a
+// send stream.
+func parseOpenMessage(t *testing.T, b []byte) dataChannelOpenMessage {
+	t.Helper()
+	r := quicvarint.NewReader(bytes.NewReader(b))
+	channelID, err := quicvarint.Read(r)
+	require.NoError(t, err)
+	mt, err := quicvarint.Read(r)
+	require.NoError(t, err)
+	require.Equal(t, uint64(dataChannelOpenMessageType), mt)
+	m := dataChannelOpenMessage{ChannelID: channelID}
+	require.NoError(t, m.parsePayload(r))
+	return m
+}
+
 func openOkStream(id int64, channelID uint64) *fakeReceiveStream {
 	m := dataChannelOpenOkMessage{ChannelID: channelID}
 	return &fakeReceiveStream{r: bytes.NewReader(m.append(nil)), id: id}
@@ -290,6 +319,23 @@ func TestUnknownMessageType(t *testing.T) {
 	assert.Equal(t, uint64(errorCodeProtocolViolation), code)
 }
 
+func TestUnknownChannelTypeFailsSession(t *testing.T) {
+	conn := newFakeConn()
+	_, _, done := runSession(conn)
+	m := dataChannelOpenMessage{
+		ChannelID:   1,
+		ChannelType: 0x42,
+		Label:       "label",
+		Protocol:    "protocol",
+	}
+	conn.accept <- &fakeReceiveStream{r: bytes.NewReader(m.append(nil)), id: 0}
+
+	assert.ErrorIs(t, <-done, errProtocolViolation)
+	closed, code := conn.closeInfo()
+	assert.True(t, closed)
+	assert.Equal(t, uint64(errorCodeProtocolViolation), code)
+}
+
 func TestOrderedDelivery(t *testing.T) {
 	conn := newFakeConn()
 	s, dcs, done := runSession(conn)
@@ -318,6 +364,132 @@ func TestOrderedDelivery(t *testing.T) {
 
 	require.NoError(t, s.Close())
 	<-done
+}
+
+func TestUnorderedDelivery(t *testing.T) {
+	conn := newFakeConn()
+	s, dcs, done := runSession(conn)
+	conn.accept <- unorderedOpenStream(0, 1, dataChannelTypeReliableUnordered, 0)
+	dc := <-dcs
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	// Every message is delivered as it arrives, so a gap below it never
+	// holds it back and nothing is buffered.
+	for i, seqNr := range []uint64{2, 0, 1} {
+		conn.accept <- messageStream(int64(2*(i+1)), 1, seqNr, "payload")
+		msg, err := dc.ReceiveMessage(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, seqNr, msg.SequenceNumber)
+		assert.Equal(t, 0, dc.reorderBuffer.size())
+
+		body, err := io.ReadAll(msg)
+		require.NoError(t, err)
+		assert.Equal(t, "payload", string(body))
+	}
+
+	require.NoError(t, s.Close())
+	<-done
+}
+
+func TestIncomingPartialReliableUnorderedChannel(t *testing.T) {
+	conn := newFakeConn()
+	s, dcs, done := runSession(conn)
+	conn.accept <- unorderedOpenStream(0, 1, dataChannelTypePartialReliableTimedUnordered, 20*time.Millisecond)
+	dc := <-dcs
+
+	assert.False(t, dc.ordered)
+	assert.Equal(t, 20*time.Millisecond, dc.rxTime)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	// A gap never holds a message back, so nothing waits for the rxTime timer.
+	conn.accept <- messageStream(2, 1, 5, "payload")
+	msg, err := dc.ReceiveMessage(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(5), msg.SequenceNumber)
+	assert.Equal(t, 0, dc.reorderBuffer.size())
+
+	require.NoError(t, s.Close())
+	<-done
+}
+
+func TestUnorderedRepeatedSequenceNumberFailsSession(t *testing.T) {
+	conn := newFakeConn()
+	_, dcs, done := runSession(conn)
+	conn.accept <- unorderedOpenStream(0, 1, dataChannelTypeReliableUnordered, 0)
+	dc := <-dcs
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	conn.accept <- messageStream(2, 1, 0, "payload")
+	_, err := dc.ReceiveMessage(ctx)
+	require.NoError(t, err)
+
+	// An unordered channel does not order its messages, but the peer still
+	// has to use every sequence number exactly once.
+	conn.accept <- messageStream(4, 1, 0, "repeat")
+
+	assert.ErrorIs(t, <-done, errProtocolViolation)
+	closed, code := conn.closeInfo()
+	assert.True(t, closed)
+	assert.Equal(t, uint64(errorCodeProtocolViolation), code)
+}
+
+func TestUnorderedSequenceWindowOverflow(t *testing.T) {
+	const windowLen = 4
+
+	conn := newFakeConn()
+	_, dcs, done := runSession(conn, WithMaxReorderBufferLen(windowLen))
+	conn.accept <- unorderedOpenStream(0, 1, dataChannelTypeReliableUnordered, 0)
+	dc := <-dcs
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	conn.accept <- messageStream(2, 1, windowLen, "payload")
+	_, err := dc.ReceiveMessage(ctx)
+	require.NoError(t, err)
+
+	// Sequence number 0 is windowLen behind the highest number seen, so the
+	// window can no longer tell whether it is a repeat.
+	conn.accept <- messageStream(4, 1, 0, "too old")
+
+	assert.ErrorIs(t, <-done, ErrSequenceWindowOverflow)
+	closed, code := conn.closeInfo()
+	assert.True(t, closed)
+	assert.Equal(t, uint64(errorCodeExcessiveLoad), code)
+}
+
+func TestUnorderedPartialReliabilityDropsMessageBehindWindow(t *testing.T) {
+	const windowLen = 4
+
+	conn := newFakeConn()
+	s, dcs, done := runSession(conn, WithMaxReorderBufferLen(windowLen))
+	conn.accept <- unorderedOpenStream(0, 1, dataChannelTypePartialReliableTimedUnordered, 20*time.Millisecond)
+	dc := <-dcs
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	conn.accept <- messageStream(2, 1, windowLen, "payload")
+	_, err := dc.ReceiveMessage(ctx)
+	require.NoError(t, err)
+
+	// A partially reliable channel drops what it cannot check instead of
+	// failing the session.
+	stale := messageStream(4, 1, 0, "too old")
+	conn.accept <- stale
+	assert.Eventually(t, stale.wasCancelled, time.Second, time.Millisecond)
+
+	closed, _ := conn.closeInfo()
+	assert.False(t, closed)
+
+	require.NoError(t, s.Close())
+	assert.ErrorIs(t, <-done, errSessionClosed)
 }
 
 func TestStaleSequenceNumberFailsSession(t *testing.T) {
@@ -520,6 +692,83 @@ func TestSendMessageExpires(t *testing.T) {
 	streams := conn.sendStreams()
 	require.Len(t, streams, 2)
 	assert.Eventually(t, streams[1].wasCancelled, time.Second, time.Millisecond)
+
+	require.NoError(t, s.Close())
+	assert.ErrorIs(t, <-done, errSessionClosed)
+}
+
+func TestOpenSendsChannelType(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		ordered bool
+		rxTime  time.Duration
+		want    dataChannelType
+	}{
+		{"reliable ordered", true, 0, dataChannelTypeReliable},
+		{"reliable unordered", false, 0, dataChannelTypeReliableUnordered},
+		{"partial reliable ordered", true, 20 * time.Millisecond, dataChannelTypePartialReliableTimed},
+		{"partial reliable unordered", false, 20 * time.Millisecond, dataChannelTypePartialReliableTimedUnordered},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := newFakeConn()
+			s, _, done := runSession(conn)
+
+			errs := make(chan error, 1)
+			go func() {
+				_, err := s.OpenDataChannel(context.Background(), 1, 7, tc.ordered, tc.rxTime, "label", "protocol")
+				errs <- err
+			}()
+			require.Eventually(t, func() bool {
+				_, ok := s.getChannel(1)
+				return ok
+			}, time.Second, time.Millisecond)
+			conn.accept <- openOkStream(0, 1)
+			require.NoError(t, <-errs)
+
+			streams := conn.sendStreams()
+			require.Len(t, streams, 1)
+			m := parseOpenMessage(t, streams[0].bytes())
+			assert.Equal(t, uint64(1), m.ChannelID)
+			assert.Equal(t, tc.want, m.ChannelType)
+			assert.Equal(t, uint64(7), m.Priority)
+			assert.Equal(t, uint64(tc.rxTime.Milliseconds()), m.ReliabilityParameter)
+			assert.Equal(t, "label", m.Label)
+			assert.Equal(t, "protocol", m.Protocol)
+
+			require.NoError(t, s.Close())
+			assert.ErrorIs(t, <-done, errSessionClosed)
+		})
+	}
+}
+
+func TestOpenUnorderedChannelDeliversOutOfOrder(t *testing.T) {
+	conn := newFakeConn()
+	s, _, done := runSession(conn)
+
+	dcs := make(chan *DataChannel, 1)
+	errs := make(chan error, 1)
+	go func() {
+		dc, err := s.OpenDataChannel(context.Background(), 1, 0, false, 0, "label", "protocol")
+		errs <- err
+		dcs <- dc
+	}()
+	require.Eventually(t, func() bool {
+		_, ok := s.getChannel(1)
+		return ok
+	}, time.Second, time.Millisecond)
+	conn.accept <- openOkStream(0, 1)
+	require.NoError(t, <-errs)
+	dc := <-dcs
+
+	// The locally opened channel is unordered too, so a message ahead of the
+	// gap is delivered right away.
+	conn.accept <- messageStream(2, 1, 3, "payload")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	msg, err := dc.ReceiveMessage(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(3), msg.SequenceNumber)
+	assert.Equal(t, 0, dc.reorderBuffer.size())
 
 	require.NoError(t, s.Close())
 	assert.ErrorIs(t, <-done, errSessionClosed)

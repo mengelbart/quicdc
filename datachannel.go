@@ -45,6 +45,12 @@ var ErrDataChannelClosed = errors.New("data channel closed")
 // gap stayed unfilled.
 var ErrReorderBufferOverflow = errors.New("reorder buffer overflow")
 
+// ErrSequenceWindowOverflow tears the session down when an unordered data
+// channel receives a sequence number that fell behind the window it uses to
+// detect repeats, which means the peer reordered further than the window is
+// wide.
+var ErrSequenceWindowOverflow = errors.New("sequence window overflow")
+
 type DataChannel struct {
 	session       *Session
 	nextSendSeqNr atomic.Uint64
@@ -54,7 +60,10 @@ type DataChannel struct {
 	recvLock      sync.Mutex
 	nextRecvSeqNr uint64
 	reorderBuffer *messageHeap
-	recvBuffer    chan *DataChannelReadMessage
+	// recvWindow detects repeated sequence numbers on an unordered channel.
+	// It is nil on an ordered channel, where the reorder buffer does that.
+	recvWindow *sequenceWindow
+	recvBuffer chan *DataChannelReadMessage
 	// gapTimer bounds how long an ordered partially reliable channel waits
 	// for a missing message. It is nil while the reorder buffer holds no gap.
 	gapTimer *time.Timer
@@ -88,10 +97,15 @@ func newDataChannel(
 	label string,
 	protocol string,
 ) *DataChannel {
+	var recvWindow *sequenceWindow
+	if !ordered {
+		recvWindow = newSequenceWindow(session.maxReorderBufferLen)
+	}
 	return &DataChannel{
 		session:       session,
 		nextRecvSeqNr: 0,
 		reorderBuffer: &messageHeap{},
+		recvWindow:    recvWindow,
 		recvBuffer:    make(chan *DataChannelReadMessage),
 		id:            id,
 		priority:      priority,
@@ -260,10 +274,34 @@ func (d *DataChannel) handleIncomingMessageStream(ctx context.Context, s Receive
 		stream:         s,
 	}
 	if !d.ordered {
-		d.pushMessage(ctx, rm)
-		return nil
+		return d.enqueueUnordered(ctx, rm)
 	}
 	return d.enqueueOrdered(ctx, rm)
+}
+
+// enqueueUnordered delivers rm right away. An unordered channel promises
+// nothing about delivery order, but the peer must still use every sequence
+// number exactly once, so a repeat is a protocol violation and tears the
+// session down. A number that fell behind the window cannot be checked: on a
+// reliable channel that means the peer reordered further than the window is
+// wide and tears the session down too, on a partially reliable channel it is
+// dropped.
+func (d *DataChannel) enqueueUnordered(ctx context.Context, rm *DataChannelReadMessage) error {
+	d.recvLock.Lock()
+	repeat, tooOld := d.recvWindow.record(rm.SequenceNumber)
+	d.recvLock.Unlock()
+
+	if repeat {
+		return fmt.Errorf("%w: repeated sequence number %v on channel %v", errProtocolViolation, rm.SequenceNumber, d.id)
+	}
+	if tooOld {
+		if !d.partiallyReliable() {
+			return fmt.Errorf("%w: channel %v received sequence number %v", ErrSequenceWindowOverflow, d.id, rm.SequenceNumber)
+		}
+		return d.dropExpired(rm)
+	}
+	d.pushMessage(ctx, rm)
+	return nil
 }
 
 // enqueueOrdered buffers rm and delivers whatever became deliverable. A
