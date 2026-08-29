@@ -18,6 +18,7 @@ const (
 	dataChannelOpenMessageType messageType = iota
 	dataChannelOpenOkMessageType
 	dataChannelMessageType
+	dataChannelCloseMessageType
 )
 
 type dataChannelType uint64
@@ -98,6 +99,15 @@ type dataChannelOpenOkMessage struct {
 func (m *dataChannelOpenOkMessage) append(b []byte) []byte {
 	b = quicvarint.Append(b, m.ChannelID)
 	return quicvarint.Append(b, uint64(dataChannelOpenOkMessageType))
+}
+
+type dataChannelCloseMessage struct {
+	ChannelID uint64
+}
+
+func (m *dataChannelCloseMessage) append(b []byte) []byte {
+	b = quicvarint.Append(b, m.ChannelID)
+	return quicvarint.Append(b, uint64(dataChannelCloseMessageType))
 }
 
 type dataChannelMessage struct {
