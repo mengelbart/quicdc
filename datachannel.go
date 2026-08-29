@@ -17,7 +17,8 @@ type prioritySetter interface {
 }
 
 const (
-	errorCodeUnknownFlowID = 0x01
+	errorCodeUnknownFlowID     = 0x01
+	errorCodeProtocolViolation = 0x02
 )
 
 type DataChannel struct {
@@ -40,6 +41,11 @@ type DataChannel struct {
 
 	ackChan chan struct{}
 	ackOnce sync.Once
+
+	// errChan is closed once err is set.
+	errChan chan struct{}
+	errOnce sync.Once
+	err     error
 }
 
 func newDataChannel(
@@ -63,10 +69,14 @@ func newDataChannel(
 		label:         label,
 		protocol:      protocol,
 		ackChan:       make(chan struct{}),
+		errChan:       make(chan struct{}),
 	}
 }
 
-func (d *DataChannel) open() error {
+// open sends the DATA_CHANNEL_OPEN message and waits for the peer's
+// acknowledgement. It returns when the channel fails, ctx is done or
+// sessionClosed is closed.
+func (d *DataChannel) open(ctx context.Context, sessionClosed <-chan struct{}) error {
 	s, err := d.connection.OpenUniStream()
 	if err != nil {
 		return err
@@ -94,9 +104,26 @@ func (d *DataChannel) open() error {
 	}
 
 	// wait for DATA_CHANNEL_OPEN_ACK message
-	<-d.ackChan
+	select {
+	case <-d.ackChan:
+	case <-d.errChan:
+		return d.err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-sessionClosed:
+		return errSessionClosed
+	}
 
 	return nil
+}
+
+// setError records a fatal error on the data channel and unblocks pending
+// operations. Only the first error is kept.
+func (d *DataChannel) setError(err error) {
+	d.errOnce.Do(func() {
+		d.err = err
+		close(d.errChan)
+	})
 }
 
 // handleAck informs the open() goroutine that the open ack message has been
@@ -185,6 +212,8 @@ func (d *DataChannel) ReceiveMessage(ctx context.Context) (*DataChannelReadMessa
 		return nil, ctx.Err()
 	case msg := <-d.recvBuffer:
 		return msg, nil
+	case <-d.errChan:
+		return nil, d.err
 	}
 }
 

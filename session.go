@@ -2,6 +2,7 @@ package quicdc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -26,9 +27,18 @@ type Connection interface {
 	OpenUniStream() (SendStream, error)
 	OpenUniStreamSync(context.Context) (SendStream, error)
 	AcceptUniStream(context.Context) (ReceiveStream, error)
+	CloseWithError(uint64, string) error
 }
 
 type OnDataChannelHandler func(*DataChannel)
+
+// errSessionClosed is returned by operations that were waiting when the
+// session's read loop stopped.
+var errSessionClosed = errors.New("session closed")
+
+// errProtocolViolation marks an error caused by the peer breaking the
+// protocol. It tears the session down.
+var errProtocolViolation = errors.New("protocol violation")
 
 type Session struct {
 	conn     Connection
@@ -39,6 +49,10 @@ type Session struct {
 
 	dcHandler   OnDataChannelHandler
 	handlerLock sync.Mutex
+
+	closed    chan struct{}
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func NewSession(conn Connection) *Session {
@@ -47,17 +61,22 @@ func NewSession(conn Connection) *Session {
 		acceptCh:    make(chan ReceiveStream),
 		channels:    map[uint64]*DataChannel{},
 		channelLock: sync.Mutex{},
+		closed:      make(chan struct{}),
 	}
 	return pc
 }
 
 // Read starts a loop reading incoming streams from the session's connection.
+// It returns when ctx is done or the connection stops accepting streams. An
+// error on a single stream is reported to the data channel the stream belongs
+// to, a protocol violation closes the connection and tears the session down.
 // Read must not be called if the connection is managed by the application.
-func (c *Session) Read() {
+func (c *Session) Read(ctx context.Context) error {
 	for {
-		s, err := c.conn.AcceptUniStream(context.Background())
+		s, err := c.conn.AcceptUniStream(ctx)
 		if err != nil {
-			panic(err)
+			c.close(err)
+			return c.closeErr
 		}
 		// Each stream is handled in its own goroutine, so that a stream
 		// waiting for the application to read a message does not block the
@@ -65,23 +84,56 @@ func (c *Session) Read() {
 		go func() {
 			id, err := quicvarint.Read(quicvarint.NewReader(s))
 			if err != nil {
-				log.Printf("failed to read channel ID: %v", err)
+				log.Printf("dropping stream: failed to read channel ID: %v", err)
 				return
 			}
-			if err := c.ReadStream(context.Background(), s, id); err != nil {
-				log.Printf("failed to read stream for channel ID %v: %v", id, err)
+			if err := c.ReadStream(ctx, s, id); err != nil {
+				if errors.Is(err, errProtocolViolation) {
+					c.abort(err)
+					return
+				}
+				dc, ok := c.getChannel(id)
+				if !ok {
+					log.Printf("dropping stream for channel ID %v: %v", id, err)
+					return
+				}
+				dc.setError(err)
 			}
 		}()
 	}
 }
 
-func (s *Session) OpenDataChannel(channelID, priority uint64, ordered bool, rxTime time.Duration, label string, protocol string) (*DataChannel, error) {
+// close records why the session stopped, unblocks pending opens and fails all
+// data channels. Only the first error is kept.
+func (c *Session) close(err error) {
+	c.closeOnce.Do(func() {
+		c.closeErr = err
+		close(c.closed)
+		for _, dc := range c.allChannels() {
+			dc.setError(err)
+		}
+	})
+}
+
+// abort tears the session down and tells the peer why.
+func (c *Session) abort(err error) {
+	c.close(err)
+	_ = c.conn.CloseWithError(errorCodeProtocolViolation, err.Error())
+}
+
+// OpenDataChannel opens a new data channel and waits for the peer to
+// acknowledge it. It returns when ctx is done or the session's read loop
+// stopped.
+func (s *Session) OpenDataChannel(ctx context.Context, channelID, priority uint64, ordered bool, rxTime time.Duration, label string, protocol string) (*DataChannel, error) {
 	dc := newDataChannel(s.conn, channelID, priority, ordered, rxTime, label, protocol)
 	if err := s.addChannel(channelID, dc); err != nil {
 		return nil, err
 	}
-	if err := dc.open(); err != nil {
+	if err := dc.open(ctx, s.closed); err != nil {
 		s.removeChannel(channelID)
+		if errors.Is(err, errSessionClosed) && s.closeErr != nil {
+			return nil, fmt.Errorf("%w: %w", errSessionClosed, s.closeErr)
+		}
 		return nil, err
 	}
 	return dc, nil
@@ -115,7 +167,7 @@ func (s *Session) ReadStream(ctx context.Context, stream ReceiveStream, channelI
 			m.Protocol,
 		)
 		if err := s.addChannel(channelID, dc); err != nil {
-			return err
+			return fmt.Errorf("%w: %w", errProtocolViolation, err)
 		}
 		ackStream, err := s.conn.OpenUniStreamSync(ctx)
 		if err != nil {
@@ -135,14 +187,14 @@ func (s *Session) ReadStream(ctx context.Context, stream ReceiveStream, channelI
 		log.Printf("received dataChannelOpenOkMessage for channel ID: %v", channelID)
 		dc, ok := s.getChannel(channelID)
 		if !ok {
-			return fmt.Errorf("got OpenOk message for unknown channel ID: %v", channelID)
+			return fmt.Errorf("%w: got OpenOk message for unknown channel ID: %v", errProtocolViolation, channelID)
 		}
 		dc.handleAck()
 		return nil
 	case uint64(dataChannelMessageType):
 		dc, ok := s.getChannel(channelID)
 		if !ok {
-			return fmt.Errorf("got message for unknown channel ID: %v", channelID)
+			return fmt.Errorf("%w: got message for unknown channel ID: %v", errProtocolViolation, channelID)
 		}
 		return dc.handleIncomingMessageStream(ctx, stream)
 	}
@@ -178,6 +230,16 @@ func (s *Session) removeChannel(id uint64) {
 	s.channelLock.Lock()
 	defer s.channelLock.Unlock()
 	delete(s.channels, id)
+}
+
+func (s *Session) allChannels() []*DataChannel {
+	s.channelLock.Lock()
+	defer s.channelLock.Unlock()
+	channels := make([]*DataChannel, 0, len(s.channels))
+	for _, dc := range s.channels {
+		channels = append(channels, dc)
+	}
+	return channels
 }
 
 func (s *Session) getChannel(id uint64) (*DataChannel, bool) {
