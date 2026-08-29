@@ -252,7 +252,7 @@ func (d *DataChannel) drainReorderBuffer(ctx context.Context) {
 func (d *DataChannel) handleIncomingMessageStream(ctx context.Context, s ReceiveStream) error {
 	s = newBufferedStream(s)
 	m := dataChannelMessage{}
-	if err := m.parse(quicvarint.NewReader(s)); err != nil {
+	if err := m.parsePayload(quicvarint.NewReader(s)); err != nil {
 		return err
 	}
 	rm := &DataChannelReadMessage{
