@@ -16,9 +16,10 @@ import (
 var errFakeConnClosed = errors.New("fake connection closed")
 
 type fakeSendStream struct {
-	lock   sync.Mutex
-	buf    bytes.Buffer
-	closed bool
+	lock      sync.Mutex
+	buf       bytes.Buffer
+	closed    bool
+	cancelled bool
 }
 
 func (s *fakeSendStream) Write(p []byte) (int, error) {
@@ -32,6 +33,18 @@ func (s *fakeSendStream) Close() error {
 	defer s.lock.Unlock()
 	s.closed = true
 	return nil
+}
+
+func (s *fakeSendStream) CancelWrite(uint64) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	s.cancelled = true
+}
+
+func (s *fakeSendStream) wasCancelled() bool {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	return s.cancelled
 }
 
 func (s *fakeSendStream) bytes() []byte {
@@ -139,6 +152,24 @@ func openStream(id int64, channelID uint64) *fakeReceiveStream {
 		Label:     "label",
 		Protocol:  "protocol",
 	}
+	return &fakeReceiveStream{r: bytes.NewReader(m.append(nil)), id: id}
+}
+
+// partialReliableOpenStream opens an ordered channel whose sender gives up on
+// a message after rxTime.
+func partialReliableOpenStream(id int64, channelID uint64, rxTime time.Duration) *fakeReceiveStream {
+	m := dataChannelOpenMessage{
+		ChannelID:            channelID,
+		ChannelType:          dataChannelTypePartialReliableTimed,
+		ReliabilityParameter: uint64(rxTime.Milliseconds()),
+		Label:                "label",
+		Protocol:             "protocol",
+	}
+	return &fakeReceiveStream{r: bytes.NewReader(m.append(nil)), id: id}
+}
+
+func openOkStream(id int64, channelID uint64) *fakeReceiveStream {
+	m := dataChannelOpenOkMessage{ChannelID: channelID}
 	return &fakeReceiveStream{r: bytes.NewReader(m.append(nil)), id: id}
 }
 
@@ -361,4 +392,135 @@ func TestDefaultMaxReorderBufferLen(t *testing.T) {
 	// Values below one keep the default.
 	s = NewSession(newFakeConn(), WithMaxReorderBufferLen(0))
 	assert.Equal(t, defaultMaxReorderBufferLen, s.maxReorderBufferLen)
+}
+
+func TestPartialReliabilitySkipsGapAfterRxTime(t *testing.T) {
+	conn := newFakeConn()
+	s, dcs, done := runSession(conn)
+	conn.accept <- partialReliableOpenStream(0, 1, 20*time.Millisecond)
+	dc := <-dcs
+
+	// Sequence number 0 is never sent, so the channel gives up on it once
+	// rxTime has passed and delivers what is behind the gap.
+	conn.accept <- messageStream(2, 1, 1, "second")
+	msg, err := dc.ReceiveMessage(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), msg.SequenceNumber)
+
+	// Delivery continues from the new sequence number.
+	conn.accept <- messageStream(4, 1, 2, "third")
+	msg, err = dc.ReceiveMessage(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, uint64(2), msg.SequenceNumber)
+
+	require.NoError(t, s.Close())
+	assert.ErrorIs(t, <-done, errSessionClosed)
+}
+
+func TestPartialReliabilityDropsExpiredMessage(t *testing.T) {
+	conn := newFakeConn()
+	s, dcs, done := runSession(conn)
+	conn.accept <- partialReliableOpenStream(0, 1, 20*time.Millisecond)
+	dc := <-dcs
+
+	conn.accept <- messageStream(2, 1, 1, "second")
+	msg, err := dc.ReceiveMessage(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), msg.SequenceNumber)
+
+	// Sequence number 0 arrives after the channel gave up on it. It is
+	// dropped, and the session survives.
+	stale := messageStream(4, 1, 0, "first")
+	conn.accept <- stale
+	assert.Eventually(t, stale.wasCancelled, time.Second, time.Millisecond)
+
+	closed, _ := conn.closeInfo()
+	assert.False(t, closed)
+
+	require.NoError(t, s.Close())
+	assert.ErrorIs(t, <-done, errSessionClosed)
+}
+
+func TestPartialReliabilityDetectsDuplicate(t *testing.T) {
+	conn := newFakeConn()
+	_, dcs, done := runSession(conn)
+	conn.accept <- partialReliableOpenStream(0, 1, time.Minute)
+	dc := <-dcs
+
+	// Sequence number 1 stays in the reorder buffer, waiting for the gap at 0.
+	conn.accept <- messageStream(2, 1, 1, "second")
+	assert.Eventually(t, func() bool {
+		return dc.reorderBuffer.size() == 1
+	}, time.Second, time.Millisecond)
+
+	conn.accept <- messageStream(4, 1, 1, "duplicate")
+
+	assert.ErrorIs(t, <-done, errProtocolViolation)
+	closed, code := conn.closeInfo()
+	assert.True(t, closed)
+	assert.Equal(t, uint64(errorCodeProtocolViolation), code)
+}
+
+func TestPartialReliabilityOverflowSkipsGap(t *testing.T) {
+	const bufferLen = 4
+
+	conn := newFakeConn()
+	s, dcs, done := runSession(conn, WithMaxReorderBufferLen(bufferLen))
+	// rxTime is long enough that only the full buffer can trigger the skip.
+	conn.accept <- partialReliableOpenStream(0, 1, time.Minute)
+	dc := <-dcs
+
+	// Sequence number 0 never arrives.
+	for i := 1; i <= bufferLen; i++ {
+		conn.accept <- messageStream(int64(2*i), 1, uint64(i), "payload")
+	}
+	assert.Eventually(t, func() bool {
+		return dc.reorderBuffer.size() == bufferLen
+	}, time.Second, time.Millisecond)
+
+	// The next message does not fit, so the channel gives up on the gap and
+	// delivers everything instead of tearing the session down.
+	conn.accept <- messageStream(4242, 1, bufferLen+1, "payload")
+	for i := 1; i <= bufferLen+1; i++ {
+		msg, err := dc.ReceiveMessage(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, uint64(i), msg.SequenceNumber)
+	}
+
+	closed, _ := conn.closeInfo()
+	assert.False(t, closed)
+
+	require.NoError(t, s.Close())
+	assert.ErrorIs(t, <-done, errSessionClosed)
+}
+
+func TestSendMessageExpires(t *testing.T) {
+	conn := newFakeConn()
+	s, _, done := runSession(conn)
+
+	dcs := make(chan *DataChannel, 1)
+	errs := make(chan error, 1)
+	go func() {
+		dc, err := s.OpenDataChannel(context.Background(), 1, 0, true, 20*time.Millisecond, "label", "protocol")
+		errs <- err
+		dcs <- dc
+	}()
+	require.Eventually(t, func() bool {
+		_, ok := s.getChannel(1)
+		return ok
+	}, time.Second, time.Millisecond)
+	conn.accept <- openOkStream(0, 1)
+	require.NoError(t, <-errs)
+	dc := <-dcs
+
+	_, err := dc.SendMessage(context.Background())
+	require.NoError(t, err)
+
+	// The message outlives rxTime, so its stream is reset.
+	streams := conn.sendStreams()
+	require.Len(t, streams, 2)
+	assert.Eventually(t, streams[1].wasCancelled, time.Second, time.Millisecond)
+
+	require.NoError(t, s.Close())
+	assert.ErrorIs(t, <-done, errSessionClosed)
 }
