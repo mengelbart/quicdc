@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -32,6 +32,17 @@ type Connection interface {
 
 type OnDataChannelHandler func(*DataChannel)
 
+// Option configures a Session.
+type Option func(*Session)
+
+// WithLogger sets the logger the session and its data channels write to. The
+// default discards everything.
+func WithLogger(logger *slog.Logger) Option {
+	return func(s *Session) {
+		s.logger = logger
+	}
+}
+
 // errSessionClosed is returned by operations that were waiting when the
 // session's read loop stopped.
 var errSessionClosed = errors.New("session closed")
@@ -53,15 +64,21 @@ type Session struct {
 	closed    chan struct{}
 	closeOnce sync.Once
 	closeErr  error
+
+	logger *slog.Logger
 }
 
-func NewSession(conn Connection) *Session {
+func NewSession(conn Connection, opts ...Option) *Session {
 	pc := &Session{
 		conn:        conn,
 		acceptCh:    make(chan ReceiveStream),
 		channels:    map[uint64]*DataChannel{},
 		channelLock: sync.Mutex{},
 		closed:      make(chan struct{}),
+		logger:      slog.New(slog.DiscardHandler),
+	}
+	for _, opt := range opts {
+		opt(pc)
 	}
 	return pc
 }
@@ -84,7 +101,7 @@ func (c *Session) Read(ctx context.Context) error {
 		go func() {
 			id, err := quicvarint.Read(quicvarint.NewReader(s))
 			if err != nil {
-				log.Printf("dropping stream: failed to read channel ID: %v", err)
+				c.logger.Warn("dropping stream: failed to read channel ID", "error", err)
 				return
 			}
 			if err := c.ReadStream(ctx, s, id); err != nil {
@@ -94,7 +111,7 @@ func (c *Session) Read(ctx context.Context) error {
 				}
 				dc, ok := c.getChannel(id)
 				if !ok {
-					log.Printf("dropping stream for channel ID %v: %v", id, err)
+					c.logger.Warn("dropping stream for unknown channel", "channel_id", id, "error", err)
 					return
 				}
 				dc.setError(err)
@@ -194,7 +211,7 @@ func (s *Session) ReadStream(ctx context.Context, stream ReceiveStream, channelI
 		s.onDataChannel(dc)
 		return nil
 	case uint64(dataChannelOpenOkMessageType):
-		log.Printf("received dataChannelOpenOkMessage for channel ID: %v", channelID)
+		s.logger.Debug("received dataChannelOpenOkMessage", "channel_id", channelID)
 		dc, ok := s.getChannel(channelID)
 		if !ok {
 			return fmt.Errorf("%w: got OpenOk message for unknown channel ID: %v", errProtocolViolation, channelID)

@@ -1,8 +1,6 @@
 module github.com/mengelbart/quicdc
 
-go 1.23
-
-toolchain go1.23.1
+go 1.26
 
 require (
 	github.com/quic-go/quic-go v0.54.0

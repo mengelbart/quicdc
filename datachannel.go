@@ -48,6 +48,8 @@ type DataChannel struct {
 	ackChan chan struct{}
 	ackOnce sync.Once
 
+	logger *slog.Logger
+
 	closeOnce sync.Once
 
 	// errChan is closed once err is set.
@@ -78,6 +80,7 @@ func newDataChannel(
 		protocol:      protocol,
 		ackChan:       make(chan struct{}),
 		errChan:       make(chan struct{}),
+		logger:        session.logger.With("channel_id", id),
 	}
 }
 
@@ -92,7 +95,7 @@ func (d *DataChannel) open(ctx context.Context, sessionClosed <-chan struct{}) e
 	defer func() { _ = s.Close() }()
 
 	if ps, ok := s.(prioritySetter); ok {
-		slog.Info("dc setting stream priority", "priority", d.priority, "incremental", true)
+		d.logger.Debug("dc setting stream priority", "priority", d.priority, "incremental", true)
 		ps.SetPriority(uint32(d.priority))
 		ps.SetIncremental(true)
 	}
@@ -262,7 +265,7 @@ func (d *DataChannel) SendMessage(ctx context.Context) (*DataChannelWriteMessage
 		return nil, err
 	}
 	if ps, ok := s.(prioritySetter); ok {
-		slog.Info("dc setting stream priority", "priority", d.priority, "incremental", true)
+		d.logger.Debug("dc setting stream priority", "priority", d.priority, "incremental", true)
 		ps.SetPriority(uint32(d.priority))
 		ps.SetIncremental(true)
 	}
