@@ -58,6 +58,26 @@ func (h *messageHeap) peek() *DataChannelReadMessage {
 	return nil
 }
 
+// size returns the number of messages in the heap.
+func (h *messageHeap) size() int {
+	h.lock.Lock()
+	defer h.lock.Unlock()
+	return len(h.data)
+}
+
+// contains reports whether the heap holds a message with sequence number
+// seqNr.
+func (h *messageHeap) contains(seqNr uint64) bool {
+	h.lock.Lock()
+	defer h.lock.Unlock()
+	for _, m := range h.data {
+		if m.SequenceNumber == seqNr {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *messageHeap) enqueue(msg *DataChannelReadMessage) {
 	h.lock.Lock()
 	defer h.lock.Unlock()

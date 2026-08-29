@@ -65,6 +65,16 @@ func WithLogger(logger *slog.Logger) Option {
 	}
 }
 
+// WithMaxReorderBufferLen bounds how many out of order messages an ordered
+// data channel buffers while it waits for a gap to be filled.
+func WithMaxReorderBufferLen(n int) Option {
+	return func(s *Session) {
+		if n > 0 {
+			s.maxReorderBufferLen = n
+		}
+	}
+}
+
 // errSessionClosed is returned by operations that were waiting when the
 // session's Run loop stopped.
 var errSessionClosed = errors.New("session closed")
@@ -87,7 +97,8 @@ type Session struct {
 	closeOnce sync.Once
 	closeErr  error
 
-	logger *slog.Logger
+	logger              *slog.Logger
+	maxReorderBufferLen int
 }
 
 func NewSession(conn Connection, opts ...Option) *Session {
@@ -98,6 +109,8 @@ func NewSession(conn Connection, opts ...Option) *Session {
 		channelLock: sync.Mutex{},
 		closed:      make(chan struct{}),
 		logger:      slog.New(slog.DiscardHandler),
+
+		maxReorderBufferLen: defaultMaxReorderBufferLen,
 	}
 	for _, opt := range opts {
 		opt(pc)
@@ -130,7 +143,11 @@ func (c *Session) Run(ctx context.Context) error {
 			}
 			if err := c.ReadStream(ctx, s, id); err != nil {
 				if errors.Is(err, errProtocolViolation) {
-					c.abort(err)
+					c.abort(errorCodeProtocolViolation, err)
+					return
+				}
+				if errors.Is(err, ErrReorderBufferOverflow) {
+					c.abort(errorCodeExcessiveLoad, err)
 					return
 				}
 				dc, ok := c.getChannel(id)
@@ -164,9 +181,9 @@ func (c *Session) Close() error {
 }
 
 // abort tears the session down and tells the peer why.
-func (c *Session) abort(err error) {
+func (c *Session) abort(code uint64, err error) {
 	c.close(err)
-	_ = c.conn.CloseWithError(errorCodeProtocolViolation, err.Error())
+	_ = c.conn.CloseWithError(code, err.Error())
 }
 
 // OpenDataChannel opens a new data channel and waits for the peer to
