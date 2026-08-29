@@ -31,18 +31,18 @@ const (
 	dataChannelTypePartialReliableTimedUnordered dataChannelType = 0x82
 )
 
-func (t dataChannelType) parameters(reliabilityParameter uint64) (ordered bool, rxTime time.Duration) {
+func (t dataChannelType) parameters(reliabilityParameter uint64) (ordered bool, rxTime time.Duration, err error) {
 	switch t {
 	case dataChannelTypeReliable:
-		return true, 0
+		return true, 0, nil
 	case dataChannelTypeReliableUnordered:
-		return false, 0
+		return false, 0, nil
 	case dataChannelTypePartialReliableTimed:
-		return true, time.Duration(reliabilityParameter) * time.Millisecond
+		return true, time.Duration(reliabilityParameter) * time.Millisecond, nil
 	case dataChannelTypePartialReliableTimedUnordered:
-		return false, time.Duration(reliabilityParameter) * time.Millisecond
+		return false, time.Duration(reliabilityParameter) * time.Millisecond, nil
 	}
-	return true, 0
+	return false, 0, fmt.Errorf("unknown data channel type: 0x%x", uint64(t))
 }
 
 type dataChannelOpenMessage struct {
