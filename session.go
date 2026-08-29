@@ -163,7 +163,10 @@ func (s *Session) ReadStream(ctx context.Context, stream ReceiveStream, channelI
 		if err := m.parse(quicvarint.NewReader(stream)); err != nil {
 			return err
 		}
-		ordered, rxTime := m.ChannelType.parameters(m.ReliabilityParameter)
+		ordered, rxTime, err := m.ChannelType.parameters(m.ReliabilityParameter)
+		if err != nil {
+			return fmt.Errorf("%w: %w", errProtocolViolation, err)
+		}
 		dc := newDataChannel(
 			s,
 			channelID,
