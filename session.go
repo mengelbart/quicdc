@@ -66,7 +66,7 @@ func WithLogger(logger *slog.Logger) Option {
 }
 
 // errSessionClosed is returned by operations that were waiting when the
-// session's read loop stopped.
+// session's Run loop stopped.
 var errSessionClosed = errors.New("session closed")
 
 // errProtocolViolation marks an error caused by the peer breaking the
@@ -105,12 +105,13 @@ func NewSession(conn Connection, opts ...Option) *Session {
 	return pc
 }
 
-// Read starts a loop reading incoming streams from the session's connection.
-// It returns when ctx is done or the connection stops accepting streams. An
-// error on a single stream is reported to the data channel the stream belongs
-// to, a protocol violation closes the connection and tears the session down.
-// Read must not be called if the connection is managed by the application.
-func (c *Session) Read(ctx context.Context) error {
+// Run accepts incoming streams from the session's connection and dispatches
+// them to their data channel. It returns when ctx is done or the connection
+// stops accepting streams. An error on a single stream is reported to the data
+// channel the stream belongs to, a protocol violation closes the connection and
+// tears the session down. Run must not be called if the connection is managed
+// by the application.
+func (c *Session) Run(ctx context.Context) error {
 	for {
 		s, err := c.conn.AcceptUniStream(ctx)
 		if err != nil {
@@ -156,7 +157,7 @@ func (c *Session) close(err error) {
 }
 
 // Close closes all data channels of the session and the underlying
-// connection, which makes a running Read loop return.
+// connection, which makes a running Run loop return.
 func (c *Session) Close() error {
 	c.close(errSessionClosed)
 	return c.conn.CloseWithError(errorCodeNoError, "")
@@ -169,7 +170,7 @@ func (c *Session) abort(err error) {
 }
 
 // OpenDataChannel opens a new data channel and waits for the peer to
-// acknowledge it. It returns when ctx is done or the session's read loop
+// acknowledge it. It returns when ctx is done or the session's Run loop
 // stopped.
 func (s *Session) OpenDataChannel(ctx context.Context, channelID, priority uint64, ordered bool, rxTime time.Duration, label string, protocol string) (*DataChannel, error) {
 	dc := newDataChannel(s, channelID, priority, ordered, rxTime, label, protocol)

@@ -148,13 +148,13 @@ func closeStream(id int64, channelID uint64) *fakeReceiveStream {
 }
 
 // runSession starts a session on conn and returns a channel of incoming data
-// channels and a channel carrying the read loop's error.
+// channels and a channel carrying the Run loop's error.
 func runSession(conn *fakeConn) (*Session, chan *DataChannel, chan error) {
 	s := NewSession(conn)
 	dcs := make(chan *DataChannel, 1)
 	s.OnIncomingDataChannel(func(dc *DataChannel) { dcs <- dc })
 	done := make(chan error, 1)
-	go func() { done <- s.Read(context.Background()) }()
+	go func() { done <- s.Run(context.Background()) }()
 	return s, dcs, done
 }
 
