@@ -110,9 +110,16 @@ func (c *Session) close(err error) {
 		c.closeErr = err
 		close(c.closed)
 		for _, dc := range c.allChannels() {
-			dc.setError(err)
+			dc.closeWithError(err)
 		}
 	})
+}
+
+// Close closes all data channels of the session and the underlying
+// connection, which makes a running Read loop return.
+func (c *Session) Close() error {
+	c.close(errSessionClosed)
+	return c.conn.CloseWithError(errorCodeNoError, "")
 }
 
 // abort tears the session down and tells the peer why.
@@ -125,7 +132,7 @@ func (c *Session) abort(err error) {
 // acknowledge it. It returns when ctx is done or the session's read loop
 // stopped.
 func (s *Session) OpenDataChannel(ctx context.Context, channelID, priority uint64, ordered bool, rxTime time.Duration, label string, protocol string) (*DataChannel, error) {
-	dc := newDataChannel(s.conn, channelID, priority, ordered, rxTime, label, protocol)
+	dc := newDataChannel(s, channelID, priority, ordered, rxTime, label, protocol)
 	if err := s.addChannel(channelID, dc); err != nil {
 		return nil, err
 	}
@@ -158,7 +165,7 @@ func (s *Session) ReadStream(ctx context.Context, stream ReceiveStream, channelI
 		}
 		ordered, rxTime := m.ChannelType.parameters(m.ReliabilityParameter)
 		dc := newDataChannel(
-			s.conn,
+			s,
 			channelID,
 			m.Priority,
 			ordered,
@@ -190,6 +197,14 @@ func (s *Session) ReadStream(ctx context.Context, stream ReceiveStream, channelI
 			return fmt.Errorf("%w: got OpenOk message for unknown channel ID: %v", errProtocolViolation, channelID)
 		}
 		dc.handleAck()
+		return nil
+	case uint64(dataChannelCloseMessageType):
+		dc, ok := s.getChannel(channelID)
+		if !ok {
+			// The channel may have been closed locally at the same time.
+			return nil
+		}
+		dc.closeWithError(ErrDataChannelClosed)
 		return nil
 	case uint64(dataChannelMessageType):
 		dc, ok := s.getChannel(channelID)

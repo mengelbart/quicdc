@@ -2,6 +2,7 @@ package quicdc
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"sync"
@@ -17,12 +18,17 @@ type prioritySetter interface {
 }
 
 const (
+	errorCodeNoError           = 0x00
 	errorCodeUnknownFlowID     = 0x01
 	errorCodeProtocolViolation = 0x02
 )
 
+// ErrDataChannelClosed is returned by operations on a data channel that was
+// closed locally or by the peer.
+var ErrDataChannelClosed = errors.New("data channel closed")
+
 type DataChannel struct {
-	connection    Connection
+	session       *Session
 	nextSendSeqNr atomic.Uint64
 
 	// recvLock guards nextRecvSeqNr and the enqueue/drain sequence on the
@@ -42,6 +48,8 @@ type DataChannel struct {
 	ackChan chan struct{}
 	ackOnce sync.Once
 
+	closeOnce sync.Once
+
 	// errChan is closed once err is set.
 	errChan chan struct{}
 	errOnce sync.Once
@@ -49,7 +57,7 @@ type DataChannel struct {
 }
 
 func newDataChannel(
-	conn Connection,
+	session *Session,
 	id uint64,
 	priority uint64,
 	ordered bool,
@@ -58,7 +66,7 @@ func newDataChannel(
 	protocol string,
 ) *DataChannel {
 	return &DataChannel{
-		connection:    conn,
+		session:       session,
 		nextRecvSeqNr: 0,
 		reorderBuffer: &messageHeap{},
 		recvBuffer:    make(chan *DataChannelReadMessage),
@@ -77,7 +85,7 @@ func newDataChannel(
 // acknowledgement. It returns when the channel fails, ctx is done or
 // sessionClosed is closed.
 func (d *DataChannel) open(ctx context.Context, sessionClosed <-chan struct{}) error {
-	s, err := d.connection.OpenUniStream()
+	s, err := d.session.conn.OpenUniStream()
 	if err != nil {
 		return err
 	}
@@ -134,10 +142,70 @@ func (d *DataChannel) handleAck() {
 	})
 }
 
+// Close closes the data channel and notifies the peer. Pending and future
+// calls to SendMessage and ReceiveMessage return ErrDataChannelClosed, and
+// messages that are still held in the reorder buffer are dropped. Repeated
+// calls are no-ops and return nil.
+func (d *DataChannel) Close() error {
+	var err error
+	d.closeOnce.Do(func() {
+		err = d.sendClose()
+		d.teardown(ErrDataChannelClosed)
+	})
+	return err
+}
+
+// closeWithError tears the data channel down without notifying the peer and
+// makes pending operations return err.
+func (d *DataChannel) closeWithError(err error) {
+	d.closeOnce.Do(func() {
+		d.teardown(err)
+	})
+}
+
+// sendClose sends the DATA_CHANNEL_CLOSE message to the peer. It does not wait
+// for stream credit, so it fails instead of blocking if the peer's stream
+// limit is exhausted.
+func (d *DataChannel) sendClose() error {
+	s, err := d.session.conn.OpenUniStream()
+	if err != nil {
+		return err
+	}
+	dccm := dataChannelCloseMessage{
+		ChannelID: d.id,
+	}
+	if _, err := s.Write(dccm.append(make([]byte, 0, 16))); err != nil {
+		_ = s.Close()
+		return err
+	}
+	return s.Close()
+}
+
+// teardown unblocks pending operations with err, removes the channel from its
+// session and discards buffered messages.
+func (d *DataChannel) teardown(err error) {
+	d.setError(err)
+	d.session.removeChannel(d.id)
+	d.discardReorderBuffer()
+}
+
+// discardReorderBuffer cancels the streams of all messages that are still
+// waiting for delivery.
+func (d *DataChannel) discardReorderBuffer() {
+	d.recvLock.Lock()
+	defer d.recvLock.Unlock()
+	for d.reorderBuffer.peek() != nil {
+		_ = d.reorderBuffer.dequeue().Close()
+	}
+}
+
 func (d *DataChannel) pushMessage(ctx context.Context, msg *DataChannelReadMessage) {
 	select {
 	case d.recvBuffer <- msg:
+	case <-d.errChan:
+		_ = msg.Close()
 	case <-ctx.Done():
+		_ = msg.Close()
 	}
 }
 
@@ -181,9 +249,15 @@ func (d *DataChannel) ID() uint64 {
 }
 
 // SendMessage opens a new stream for the next message on the data channel. It
-// is safe for concurrent use.
+// is safe for concurrent use. It returns ErrDataChannelClosed once the channel
+// has been closed.
 func (d *DataChannel) SendMessage(ctx context.Context) (*DataChannelWriteMessage, error) {
-	s, err := d.connection.OpenUniStreamSync(ctx)
+	select {
+	case <-d.errChan:
+		return nil, d.err
+	default:
+	}
+	s, err := d.session.conn.OpenUniStreamSync(ctx)
 	if err != nil {
 		return nil, err
 	}
