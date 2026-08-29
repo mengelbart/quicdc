@@ -17,10 +17,19 @@ type prioritySetter interface {
 	SetIncremental(bool)
 }
 
+// Connection error codes.
 const (
 	errorCodeNoError           = 0x00
-	errorCodeUnknownFlowID     = 0x01
 	errorCodeProtocolViolation = 0x02
+)
+
+// Stream error codes, used when resetting the read side of a message stream.
+const (
+	// errorCodeMessageAborted says the application stopped reading the message.
+	errorCodeMessageAborted = 0x03
+	// errorCodeMessageDiscarded says the message will never be delivered to
+	// the application.
+	errorCodeMessageDiscarded = 0x04
 )
 
 // ErrDataChannelClosed is returned by operations on a data channel that was
@@ -198,7 +207,7 @@ func (d *DataChannel) discardReorderBuffer() {
 	d.recvLock.Lock()
 	defer d.recvLock.Unlock()
 	for d.reorderBuffer.peek() != nil {
-		_ = d.reorderBuffer.dequeue().Close()
+		_ = d.reorderBuffer.dequeue().cancel(errorCodeMessageDiscarded)
 	}
 }
 
@@ -206,9 +215,9 @@ func (d *DataChannel) pushMessage(ctx context.Context, msg *DataChannelReadMessa
 	select {
 	case d.recvBuffer <- msg:
 	case <-d.errChan:
-		_ = msg.Close()
+		_ = msg.cancel(errorCodeMessageDiscarded)
 	case <-ctx.Done():
-		_ = msg.Close()
+		_ = msg.cancel(errorCodeMessageDiscarded)
 	}
 }
 
@@ -313,9 +322,15 @@ type DataChannelReadMessage struct {
 	stream         ReceiveStream
 }
 
-// Close implements io.ReadCloser.
+// Close implements io.ReadCloser. It tells the peer that the application
+// stopped reading the message.
 func (m *DataChannelReadMessage) Close() error {
-	m.stream.CancelRead(errorCodeUnknownFlowID)
+	return m.cancel(errorCodeMessageAborted)
+}
+
+// cancel resets the read side of the message stream with code.
+func (m *DataChannelReadMessage) cancel(code uint64) error {
+	m.stream.CancelRead(code)
 	return nil
 }
 
