@@ -223,7 +223,7 @@ func (s *Session) ReadStream(ctx context.Context, stream ReceiveStream, channelI
 		// released as soon as it is parsed.
 		defer stream.CancelRead(errorCodeNoError)
 		m := dataChannelOpenMessage{ChannelID: channelID}
-		if err := m.parse(quicvarint.NewReader(stream)); err != nil {
+		if err := m.parsePayload(quicvarint.NewReader(stream)); err != nil {
 			return err
 		}
 		ordered, rxTime, err := m.ChannelType.parameters(m.ReliabilityParameter)

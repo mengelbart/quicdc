@@ -45,6 +45,11 @@ func (t dataChannelType) parameters(reliabilityParameter uint64) (ordered bool, 
 	return false, 0, fmt.Errorf("unknown data channel type: 0x%x", uint64(t))
 }
 
+func appendHeader(b []byte, channelID uint64, t messageType) []byte {
+	b = quicvarint.Append(b, channelID)
+	return quicvarint.Append(b, uint64(t))
+}
+
 type dataChannelOpenMessage struct {
 	ChannelID            uint64
 	ChannelType          dataChannelType
@@ -55,8 +60,10 @@ type dataChannelOpenMessage struct {
 }
 
 func (m *dataChannelOpenMessage) append(b []byte) []byte {
-	b = quicvarint.Append(b, m.ChannelID)
-	b = quicvarint.Append(b, uint64(dataChannelOpenMessageType))
+	return m.appendPayload(appendHeader(b, m.ChannelID, dataChannelOpenMessageType))
+}
+
+func (m *dataChannelOpenMessage) appendPayload(b []byte) []byte {
 	b = quicvarint.Append(b, uint64(m.ChannelType))
 	b = quicvarint.Append(b, m.Priority)
 	b = quicvarint.Append(b, m.ReliabilityParameter)
@@ -66,7 +73,7 @@ func (m *dataChannelOpenMessage) append(b []byte) []byte {
 	return append(b, []byte(m.Protocol)...)
 }
 
-func (m *dataChannelOpenMessage) parse(r quicvarint.Reader) (err error) {
+func (m *dataChannelOpenMessage) parsePayload(r quicvarint.Reader) (err error) {
 	channelType, err := quicvarint.Read(r)
 	if err != nil {
 		return err
@@ -97,8 +104,7 @@ type dataChannelOpenOkMessage struct {
 }
 
 func (m *dataChannelOpenOkMessage) append(b []byte) []byte {
-	b = quicvarint.Append(b, m.ChannelID)
-	return quicvarint.Append(b, uint64(dataChannelOpenOkMessageType))
+	return appendHeader(b, m.ChannelID, dataChannelOpenOkMessageType)
 }
 
 type dataChannelCloseMessage struct {
@@ -106,8 +112,7 @@ type dataChannelCloseMessage struct {
 }
 
 func (m *dataChannelCloseMessage) append(b []byte) []byte {
-	b = quicvarint.Append(b, m.ChannelID)
-	return quicvarint.Append(b, uint64(dataChannelCloseMessageType))
+	return appendHeader(b, m.ChannelID, dataChannelCloseMessageType)
 }
 
 type dataChannelMessage struct {
@@ -115,14 +120,16 @@ type dataChannelMessage struct {
 	SequenceNumber uint64
 }
 
-func (m *dataChannelMessage) parse(r quicvarint.Reader) (err error) {
+func (m *dataChannelMessage) parsePayload(r quicvarint.Reader) (err error) {
 	m.SequenceNumber, err = quicvarint.Read(r)
 	return err
 }
 
 func (m *dataChannelMessage) append(b []byte) []byte {
-	b = quicvarint.Append(b, m.ChannelID)
-	b = quicvarint.Append(b, uint64(dataChannelMessageType))
+	return m.appendPayload(appendHeader(b, m.ChannelID, dataChannelMessageType))
+}
+
+func (m *dataChannelMessage) appendPayload(b []byte) []byte {
 	return quicvarint.Append(b, m.SequenceNumber)
 }
 
