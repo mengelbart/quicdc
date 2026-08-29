@@ -16,6 +16,7 @@ import (
 type SendStream interface {
 	io.Writer
 	io.Closer
+	CancelWrite(uint64)
 }
 
 type ReceiveStream interface {

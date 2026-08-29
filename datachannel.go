@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -56,6 +55,9 @@ type DataChannel struct {
 	nextRecvSeqNr uint64
 	reorderBuffer *messageHeap
 	recvBuffer    chan *DataChannelReadMessage
+	// gapTimer bounds how long an ordered partially reliable channel waits
+	// for a missing message. It is nil while the reorder buffer holds no gap.
+	gapTimer *time.Timer
 
 	id       uint64
 	priority uint64
@@ -216,6 +218,7 @@ func (d *DataChannel) teardown(err error) {
 func (d *DataChannel) discardReorderBuffer() {
 	d.recvLock.Lock()
 	defer d.recvLock.Unlock()
+	d.stopGapTimer()
 	for d.reorderBuffer.peek() != nil {
 		_ = d.reorderBuffer.dequeue().cancel(errorCodeMessageDiscarded)
 	}
@@ -264,23 +267,96 @@ func (d *DataChannel) handleIncomingMessageStream(ctx context.Context, s Receive
 }
 
 // enqueueOrdered buffers rm and delivers whatever became deliverable. A
-// sequence number that was delivered or buffered already is a protocol
-// violation, since QUIC already retransmits lost data, and so is a peer that
-// fills the reorder buffer. Both tear the session down.
+// sequence number that was buffered already is a protocol violation, since
+// QUIC already retransmits lost data. On a reliable channel that holds for a
+// sequence number that was delivered already too, and a peer that fills the
+// reorder buffer is a protocol violation as well. Both tear the session down.
+// On a partially reliable channel the sender may give up on a message, so a
+// message that arrives after its gap expired is dropped and a full reorder
+// buffer skips forward instead.
 func (d *DataChannel) enqueueOrdered(ctx context.Context, rm *DataChannelReadMessage) error {
 	d.recvLock.Lock()
 	defer d.recvLock.Unlock()
 
-	if rm.SequenceNumber < d.nextRecvSeqNr || d.reorderBuffer.contains(rm.SequenceNumber) {
+	if d.reorderBuffer.contains(rm.SequenceNumber) {
 		return fmt.Errorf("%w: repeated sequence number %v on channel %v", errProtocolViolation, rm.SequenceNumber, d.id)
 	}
+	if rm.SequenceNumber < d.nextRecvSeqNr {
+		if !d.partiallyReliable() {
+			return fmt.Errorf("%w: repeated sequence number %v on channel %v", errProtocolViolation, rm.SequenceNumber, d.id)
+		}
+		return d.dropExpired(rm)
+	}
 	if d.reorderBuffer.size() >= d.session.maxReorderBufferLen {
-		return fmt.Errorf("%w: channel %v is waiting for sequence number %v", ErrReorderBufferOverflow, d.id, d.nextRecvSeqNr)
+		if !d.partiallyReliable() {
+			return fmt.Errorf("%w: channel %v is waiting for sequence number %v", ErrReorderBufferOverflow, d.id, d.nextRecvSeqNr)
+		}
+		d.skipToBufferHead(ctx)
+		if rm.SequenceNumber < d.nextRecvSeqNr {
+			return d.dropExpired(rm)
+		}
 	}
 
 	d.reorderBuffer.enqueue(rm)
 	d.drainReorderBuffer(ctx)
+	d.armGapTimer()
 	return nil
+}
+
+func (d *DataChannel) partiallyReliable() bool {
+	return d.rxTime > 0
+}
+
+func (d *DataChannel) dropExpired(rm *DataChannelReadMessage) error {
+	d.logger.Debug("dropping expired message", "sequence_number", rm.SequenceNumber, "next_sequence_number", d.nextRecvSeqNr)
+	return rm.cancel(errorCodeMessageDiscarded)
+}
+
+func (d *DataChannel) skipGap() {
+	d.recvLock.Lock()
+	defer d.recvLock.Unlock()
+	d.gapTimer = nil
+	d.skipToBufferHead(context.Background())
+	d.armGapTimer()
+}
+
+// skipToBufferHead gives up on the messages missing before the head of the
+// reorder buffer and delivers what that made deliverable. It must be called
+// with recvLock held.
+func (d *DataChannel) skipToBufferHead(ctx context.Context) {
+	head := d.reorderBuffer.peek()
+	if head == nil {
+		return
+	}
+	if head.SequenceNumber > d.nextRecvSeqNr {
+		d.logger.Debug("skipping missing messages", "from", d.nextRecvSeqNr, "to", head.SequenceNumber)
+		d.nextRecvSeqNr = head.SequenceNumber
+	}
+	d.drainReorderBuffer(ctx)
+}
+
+// armGapTimer starts the gap timer if the reorder buffer is waiting for a
+// missing message and stops it otherwise. It must be called with recvLock held
+// and after draining, so that a non empty buffer means a gap.
+func (d *DataChannel) armGapTimer() {
+	if !d.partiallyReliable() {
+		return
+	}
+	if d.reorderBuffer.peek() == nil {
+		d.stopGapTimer()
+		return
+	}
+	if d.gapTimer == nil {
+		d.gapTimer = time.AfterFunc(d.rxTime, d.skipGap)
+	}
+}
+
+// stopGapTimer must be called with recvLock held.
+func (d *DataChannel) stopGapTimer() {
+	if d.gapTimer != nil {
+		d.gapTimer.Stop()
+		d.gapTimer = nil
+	}
 }
 
 func (d *DataChannel) ID() uint64 {
@@ -313,10 +389,16 @@ func (d *DataChannel) SendMessage(ctx context.Context) (*DataChannelWriteMessage
 	if err != nil {
 		return nil, err
 	}
-	return &DataChannelWriteMessage{
+	msg := &DataChannelWriteMessage{
 		SequenceNumber: dcm.SequenceNumber,
 		stream:         s,
-	}, nil
+	}
+	if d.partiallyReliable() {
+		// The message lifetime starts here. Once it is over the stream is
+		// reset, so QUIC stops retransmitting what is left of the message.
+		time.AfterFunc(d.rxTime, msg.expire)
+	}
+	return msg, nil
 }
 
 func (d *DataChannel) ReceiveMessage(ctx context.Context) (*DataChannelReadMessage, error) {
@@ -368,7 +450,13 @@ func (m *DataChannelReadMessage) Read(p []byte) (n int, err error) {
 
 type DataChannelWriteMessage struct {
 	SequenceNumber uint64
-	stream         io.WriteCloser
+	stream         SendStream
+}
+
+// expire resets the message stream once the message outlived the channel's
+// rxTime.
+func (m *DataChannelWriteMessage) expire() {
+	m.stream.CancelWrite(errorCodeMessageDiscarded)
 }
 
 // Close implements io.WriteCloser.
