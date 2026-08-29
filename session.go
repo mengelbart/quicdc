@@ -1,6 +1,7 @@
 package quicdc
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -22,6 +23,27 @@ type ReceiveStream interface {
 	ID() int64
 	CancelRead(uint64)
 }
+
+// bufferedStream wraps a ReceiveStream in a bufio.Reader, so reading the
+// varints of a message header costs one stream read instead of one per byte.
+type bufferedStream struct {
+	ReceiveStream
+	r *bufio.Reader
+}
+
+// newBufferedStream buffers s, or returns s unchanged if it is buffered
+// already. Wrapping a stream twice would lose the bytes held by the first
+// buffer.
+func newBufferedStream(s ReceiveStream) *bufferedStream {
+	if bs, ok := s.(*bufferedStream); ok {
+		return bs
+	}
+	return &bufferedStream{ReceiveStream: s, r: bufio.NewReader(s)}
+}
+
+func (s *bufferedStream) Read(p []byte) (int, error) { return s.r.Read(p) }
+
+func (s *bufferedStream) ReadByte() (byte, error) { return s.r.ReadByte() }
 
 type Connection interface {
 	OpenUniStream() (SendStream, error)
@@ -99,6 +121,7 @@ func (c *Session) Read(ctx context.Context) error {
 		// waiting for the application to read a message does not block the
 		// other channels of the session.
 		go func() {
+			s := newBufferedStream(s)
 			id, err := quicvarint.Read(quicvarint.NewReader(s))
 			if err != nil {
 				c.logger.Warn("dropping stream: failed to read channel ID", "error", err)
@@ -170,6 +193,7 @@ func (s *Session) OnIncomingDataChannel(handler OnDataChannelHandler) {
 }
 
 func (s *Session) ReadStream(ctx context.Context, stream ReceiveStream, channelID uint64) error {
+	stream = newBufferedStream(stream)
 	mt, err := quicvarint.Read(quicvarint.NewReader(stream))
 	if err != nil {
 		return err

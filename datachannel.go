@@ -97,7 +97,7 @@ func newDataChannel(
 // acknowledgement. It returns when the channel fails, ctx is done or
 // sessionClosed is closed.
 func (d *DataChannel) open(ctx context.Context, sessionClosed <-chan struct{}) error {
-	s, err := d.session.conn.OpenUniStream()
+	s, err := d.session.conn.OpenUniStreamSync(ctx)
 	if err != nil {
 		return err
 	}
@@ -237,6 +237,7 @@ func (d *DataChannel) drainReorderBuffer(ctx context.Context) {
 }
 
 func (d *DataChannel) handleIncomingMessageStream(ctx context.Context, s ReceiveStream) error {
+	s = newBufferedStream(s)
 	m := dataChannelMessage{}
 	if err := m.parse(quicvarint.NewReader(s)); err != nil {
 		return err
