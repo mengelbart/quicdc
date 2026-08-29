@@ -1,5 +1,5 @@
 COVERPROFILE ?= cover.out
-COVER_THRESHOLD ?= 5
+COVER_THRESHOLD ?= 80
 
 .PHONY: all build test lint fmt vet coverprofile cover cover-html cover-check clean
 
