@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/quic-go/quic-go/quicvarint"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -58,6 +59,12 @@ func (s *fakeReceiveStream) CancelRead(uint64) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 	s.cancelled = true
+}
+
+func (s *fakeReceiveStream) wasCancelled() bool {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	return s.cancelled
 }
 
 type fakeConn struct {
@@ -219,4 +226,30 @@ func TestSessionClose(t *testing.T) {
 	closed, code := conn.closeInfo()
 	assert.True(t, closed)
 	assert.Equal(t, uint64(errorCodeNoError), code)
+}
+
+func TestControlStreamIsReleased(t *testing.T) {
+	conn := newFakeConn()
+	s, dcs, done := runSession(conn)
+	stream := openStream(0, 1)
+	conn.accept <- stream
+	<-dcs
+
+	assert.Eventually(t, stream.wasCancelled, time.Second, time.Millisecond)
+
+	require.NoError(t, s.Close())
+	<-done
+}
+
+func TestUnknownMessageType(t *testing.T) {
+	conn := newFakeConn()
+	_, _, done := runSession(conn)
+	buf := quicvarint.Append(nil, 1)   // channel ID
+	buf = quicvarint.Append(buf, 0x42) // unknown message type
+	conn.accept <- &fakeReceiveStream{r: bytes.NewReader(buf), id: 0}
+
+	assert.ErrorIs(t, <-done, errProtocolViolation)
+	closed, code := conn.closeInfo()
+	assert.True(t, closed)
+	assert.Equal(t, uint64(errorCodeProtocolViolation), code)
 }

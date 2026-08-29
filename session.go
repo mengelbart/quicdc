@@ -200,6 +200,9 @@ func (s *Session) ReadStream(ctx context.Context, stream ReceiveStream, channelI
 	}
 	switch mt {
 	case uint64(dataChannelOpenMessageType):
+		// A control message ends with its header, so the stream can be
+		// released as soon as it is parsed.
+		defer stream.CancelRead(errorCodeNoError)
 		m := dataChannelOpenMessage{ChannelID: channelID}
 		if err := m.parse(quicvarint.NewReader(stream)); err != nil {
 			return err
@@ -235,6 +238,7 @@ func (s *Session) ReadStream(ctx context.Context, stream ReceiveStream, channelI
 		s.onDataChannel(dc)
 		return nil
 	case uint64(dataChannelOpenOkMessageType):
+		defer stream.CancelRead(errorCodeNoError)
 		s.logger.Debug("received dataChannelOpenOkMessage", "channel_id", channelID)
 		dc, ok := s.getChannel(channelID)
 		if !ok {
@@ -243,6 +247,7 @@ func (s *Session) ReadStream(ctx context.Context, stream ReceiveStream, channelI
 		dc.handleAck()
 		return nil
 	case uint64(dataChannelCloseMessageType):
+		defer stream.CancelRead(errorCodeNoError)
 		dc, ok := s.getChannel(channelID)
 		if !ok {
 			// The channel may have been closed locally at the same time.
@@ -257,7 +262,7 @@ func (s *Session) ReadStream(ctx context.Context, stream ReceiveStream, channelI
 		}
 		return dc.handleIncomingMessageStream(ctx, stream)
 	}
-	return nil
+	return fmt.Errorf("%w: unknown message type: %v", errProtocolViolation, mt)
 }
 
 func (s *Session) onDataChannel(dc *DataChannel) {
