@@ -3,6 +3,7 @@ package quicdc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -17,10 +18,14 @@ type prioritySetter interface {
 	SetIncremental(bool)
 }
 
+// defaultMaxReorderBufferLen is the default for WithMaxReorderBufferLen.
+const defaultMaxReorderBufferLen = 256
+
 // Connection error codes.
 const (
 	errorCodeNoError           = 0x00
 	errorCodeProtocolViolation = 0x02
+	errorCodeExcessiveLoad     = 0x05
 )
 
 // Stream error codes, used when resetting the read side of a message stream.
@@ -35,6 +40,11 @@ const (
 // ErrDataChannelClosed is returned by operations on a data channel that was
 // closed locally or by the peer.
 var ErrDataChannelClosed = errors.New("data channel closed")
+
+// ErrReorderBufferOverflow tears the session down when an ordered data
+// channel's reorder buffer is full, which means the peer kept sending while a
+// gap stayed unfilled.
+var ErrReorderBufferOverflow = errors.New("reorder buffer overflow")
 
 type DataChannel struct {
 	session       *Session
@@ -246,14 +256,30 @@ func (d *DataChannel) handleIncomingMessageStream(ctx context.Context, s Receive
 		SequenceNumber: m.SequenceNumber,
 		stream:         s,
 	}
-	if d.ordered {
-		d.recvLock.Lock()
-		defer d.recvLock.Unlock()
-		d.reorderBuffer.enqueue(rm)
-		d.drainReorderBuffer(ctx)
-	} else {
+	if !d.ordered {
 		d.pushMessage(ctx, rm)
+		return nil
 	}
+	return d.enqueueOrdered(ctx, rm)
+}
+
+// enqueueOrdered buffers rm and delivers whatever became deliverable. A
+// sequence number that was delivered or buffered already is a protocol
+// violation, since QUIC already retransmits lost data, and so is a peer that
+// fills the reorder buffer. Both tear the session down.
+func (d *DataChannel) enqueueOrdered(ctx context.Context, rm *DataChannelReadMessage) error {
+	d.recvLock.Lock()
+	defer d.recvLock.Unlock()
+
+	if rm.SequenceNumber < d.nextRecvSeqNr || d.reorderBuffer.contains(rm.SequenceNumber) {
+		return fmt.Errorf("%w: repeated sequence number %v on channel %v", errProtocolViolation, rm.SequenceNumber, d.id)
+	}
+	if d.reorderBuffer.size() >= d.session.maxReorderBufferLen {
+		return fmt.Errorf("%w: channel %v is waiting for sequence number %v", ErrReorderBufferOverflow, d.id, d.nextRecvSeqNr)
+	}
+
+	d.reorderBuffer.enqueue(rm)
+	d.drainReorderBuffer(ctx)
 	return nil
 }
 
